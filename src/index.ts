@@ -583,6 +583,18 @@ function emitter(stream: AssistantMessageEventStream, output: AssistantMessage) 
 	};
 }
 
+/** muse2api reports some failures in Chinese; translate the common ones and add a recovery hint. */
+const MUSE_ERRORS: [RegExp, string][] = [
+	[/首字响应超时/, "timed out waiting for Muse's first response token"],
+	[/Still sending|连接超时/, "Muse cloud VM connection timed out"],
+];
+function describeMuseError(error: unknown): Error {
+	let msg = error instanceof Error ? error.message : String(error);
+	for (const [re, en] of MUSE_ERRORS) if (re.test(msg)) msg = `${msg} (${en})`;
+	if (!/aborted/i.test(msg)) msg += ". The Muse turn was interrupted; send a follow-up such as \"continue\" to resume in the same Muse thread.";
+	return new Error(msg);
+}
+
 function progressLine(event: string, data: any): string | undefined {
 	if (event === "tool") {
 		if (data.status === "RUNNING") return undefined;
@@ -738,9 +750,11 @@ function streamLocal(model: Model<Api>, context: TranscriptContext, options?: Si
 			e.text(turn.reply.trim() || "(Muse finished this turn.)");
 			e.finish("stop");
 		} catch (error) {
+			// keep the Muse thread reference so a follow-up prompt ("continue") resumes the same thread
+			if (live?.session) output.responseId = `muse:${live.session}#ctx=${live.ctx}`;
 			live?.ctl.abort();
 			live = undefined;
-			e.fail(error, !!options?.signal?.aborted);
+			e.fail(describeMuseError(error), !!options?.signal?.aborted);
 		}
 	})();
 	return stream;
