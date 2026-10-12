@@ -12,3 +12,4 @@ cookies*.json
 accounts*.json
 data/
 .DS_Store
+__pycache__/

@@ -60,6 +60,46 @@ export interface LastStep {
 	args: unknown;
 	status?: "ok" | "error" | "pending";
 	result?: string;
+	/** set when the step is classified as non-idempotent (re-running it would change state again) */
+	nonIdempotent?: string;
+	/** epoch ms when its result was handed back to Muse */
+	finishedAt?: number;
+}
+
+const READ_ONLY_TOOLS = new Set(["read", "ls", "grep", "find", "glob", "search", "list", "view"]);
+const MUTATING_BASH: [RegExp, string][] = [
+	[/>>/, "appends to a file (>>)"],
+	[/\btee\s+(-\w*a|--append)/, "appends to a file (tee -a)"],
+	[/\bgit\s+(push|commit|merge|rebase|reset|revert|tag|cherry-pick|am|apply|stash|pull|checkout\s+-b|branch\s+-[dDmM])\b/, "mutates git state"],
+	[/(^|[;&|(\s])(rm|rmdir|mv|unlink|shred|truncate)\s/, "deletes or moves files"],
+	[/\bsed\s+(-\w*i|--in-place)/, "edits a file in place"],
+	[/\bcurl\b[^|;&]*(-X\s*(POST|PUT|PATCH|DELETE)|--request\s+(POST|PUT|PATCH|DELETE)|\s-d\s|--data|-F\s|--form|-T\s|--upload-file)/i, "sends a mutating network request"],
+	[/\b(wget|http|httpie)\b[^|;&]*(--post|POST|PUT|PATCH|DELETE)/, "sends a mutating network request"],
+	[/\b(npm|pnpm|yarn|cargo|twine|gem)\s+(publish|yank|unpublish)\b|\bpoetry\s+publish\b/, "publishes a package"],
+	[/\b(gh|glab|hub)\s+\S+\s+(create|merge|close|delete|edit|comment|review|reopen)\b|\bgh\s+release\s+upload\b/, "changes a remote repository"],
+	[/\bdocker\s+(push|rm|rmi)\b|\bkubectl\s+(apply|delete|create|patch|replace|scale|rollout)\b|\bterraform\s+(apply|destroy)\b|\bhelm\s+(install|upgrade|uninstall)\b/, "changes infrastructure"],
+	[/\b(ssh|scp|rsync|sftp)\b/, "runs on or copies to another host"],
+	[/\b(psql|mysql|sqlite3|mongo|mongosh|redis-cli)\b/, "talks to a database"],
+	[/\b(sendmail|mail|mutt)\b/, "sends mail"],
+	[/\b(pip|npm|pnpm|yarn|apt|apt-get|brew)\s+(install|add|remove|uninstall)\b/, "installs or removes packages"],
+];
+
+/**
+ * Non-idempotent tool calls: running them twice changes state twice (or fails).
+ * `fileExisted` is checked by the caller before Pi runs a write/edit.
+ * Returns the reason, or undefined when the call is safe to repeat.
+ */
+export function nonIdempotentReason(tool: string, args: any, fileExisted?: boolean): string | undefined {
+	const t = tool.toLowerCase();
+	if (READ_ONLY_TOOLS.has(t)) return undefined;
+	if (t === "bash" || t === "shell" || t === "exec") {
+		const cmd = String(args?.command ?? args?.cmd ?? "");
+		for (const [re, why] of MUTATING_BASH) if (re.test(cmd)) return why;
+		return undefined;
+	}
+	if (t === "write") return fileExisted ? "overwrites an existing file" : undefined;
+	if (t === "edit" || t === "multiedit" || t === "patch" || t === "apply_patch") return "edits an existing file";
+	return `unknown tool "${tool}" (treated as non-idempotent)`;
 }
 
 export function summarize(v: unknown, n = 160): string {
@@ -112,10 +152,15 @@ export interface AutoContinueConfig {
 export interface ThreadState {
 	status?: string | null; // running | completed | interrupted | failed ...
 	reply?: string | null;
+	/** muse2api still holds the page/device for this thread (request timed out, Muse still running) */
+	held?: boolean;
+	owner_is_you?: boolean;
+	busy?: boolean;
 }
 
 export type Recovery =
-	| { action: "present"; reply: string; waitedMs: number } // Muse finished on its own: show its result, send nothing
+	| { action: "present"; reply: string; waitedMs: number; wasRunning: boolean } // Muse finished on its own: show its result, send nothing
+	| { action: "attach"; waitedMs: number } // muse2api still holds the turn for us: re-attach to its stream, send nothing
 	| { action: "continue"; cancelled: boolean; waitedMs: number; status?: string | null } // thread idle: send continuation
 	| { action: "stop"; reason: string }; // cannot do it safely
 
@@ -129,7 +174,15 @@ export interface RecoveryDeps {
 
 const KNOWN = new Set(["running", "completed", "interrupted", "cancelled", "canceled", "failed", "error", "idle"]);
 
-export async function recoverTurn(session: string | undefined, cfg: AutoContinueConfig, deps: RecoveryDeps): Promise<Recovery> {
+export interface RecoverOpts {
+	allowAttach?: boolean;
+	/** a held turn owned by another client: report busy instead of waiting */
+	foreignIsBusy?: boolean;
+	/** never cancel (used before a manual send: someone else's turn is not ours to stop) */
+	noCancel?: boolean;
+}
+
+export async function recoverTurn(session: string | undefined, cfg: AutoContinueConfig, deps: RecoveryDeps, opts: RecoverOpts = {}): Promise<Recovery> {
 	if (!session) return { action: "stop", reason: "no Muse thread id is known for this turn, so its state cannot be checked" };
 	const t0 = Date.now();
 	const state = async (): Promise<ThreadState | undefined> => {
@@ -144,6 +197,10 @@ export async function recoverTurn(session: string | undefined, cfg: AutoContinue
 	};
 	let s = await state();
 	if (!s) return { action: "stop", reason: "the Muse thread state could not be determined (state query failed or returned an unknown status)" };
+	if (s.status === "running" && s.held && s.owner_is_you && opts.allowAttach !== false) return { action: "attach", waitedMs: 0 };
+	if (s.status === "running" && s.held && !s.owner_is_you && opts.foreignIsBusy)
+		return { action: "stop", reason: "the Muse thread is busy with a turn started from another Pi window" };
+	const wasRunning = s.status === "running";
 	while (s.status === "running" && Date.now() - t0 < cfg.maxWaitMs) {
 		if (deps.aborted?.()) return { action: "stop", reason: "aborted by user" };
 		await deps.sleep(Math.min(cfg.pollMs, Math.max(0, cfg.maxWaitMs - (Date.now() - t0))));
@@ -151,6 +208,7 @@ export async function recoverTurn(session: string | undefined, cfg: AutoContinue
 		if (!s) return { action: "stop", reason: "the Muse thread state could not be determined while waiting" };
 	}
 	const waitedMs = Date.now() - t0;
+	if (s.status === "running" && opts.noCancel) return { action: "stop", reason: `the Muse thread was still busy after waiting ${Math.round(waitedMs / 1000)}s` };
 	if (s.status === "running") {
 		deps.log("thread_cancel", { session, waitedMs });
 		let c: { cancelled: boolean; status?: string | null };
@@ -164,6 +222,6 @@ export async function recoverTurn(session: string | undefined, cfg: AutoContinue
 			return { action: "stop", reason: `the Muse turn was still running after ${Math.round(waitedMs / 1000)}s and could not be stopped` };
 		return { action: "continue", cancelled: c.cancelled, waitedMs, status: after.status };
 	}
-	if (s.status === "completed" && s.reply && s.reply.trim()) return { action: "present", reply: s.reply, waitedMs };
+	if (s.status === "completed" && s.reply && s.reply.trim()) return { action: "present", reply: s.reply, waitedMs, wasRunning };
 	return { action: "continue", cancelled: false, waitedMs, status: s.status };
 }

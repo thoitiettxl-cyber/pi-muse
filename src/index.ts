@@ -31,7 +31,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { appendFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { homedir, hostname, tmpdir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
-import { type AutoContinueConfig, classifyMuseError, continuationMessage, type LastStep, recoverTurn, summarize, ThreadLock } from "./autocontinue.ts";
+import { classifyMuseError, continuationMessage, type LastStep, nonIdempotentReason, type RecoverOpts, recoverTurn, summarize, ThreadLock } from "./autocontinue.ts";
 import { collectSchemaTypes, decodeValue, type InbandTool, parseInvokes, renderToolResponses, renderToolsPrompt } from "./xml-dialect.ts";
 
 // ---------------------------------------------------------------------------
@@ -57,6 +57,8 @@ interface MuseConfig {
 	idleTimeout?: number;
 	/** JSON-lines log of turn errors and recovery decisions */
 	logFile: string;
+	/** don't auto-continue if the turn broke within this many seconds after a non-idempotent device step */
+	nonIdempotentWindowSeconds: number;
 }
 
 function loadConfig(): MuseConfig {
@@ -79,6 +81,7 @@ function loadConfig(): MuseConfig {
 		backoffSeconds: (process.env.PI_MUSE_BACKOFF ? process.env.PI_MUSE_BACKOFF.split(",").map(Number) : file.backoffSeconds) ?? [2, 5, 10],
 		firstByteTimeout: num(process.env.PI_MUSE_FIRST_BYTE_TIMEOUT ?? file.firstByteTimeout),
 		idleTimeout: num(process.env.PI_MUSE_IDLE_TIMEOUT ?? file.idleTimeout),
+		nonIdempotentWindowSeconds: Number(process.env.PI_MUSE_NON_IDEMPOTENT_WINDOW ?? file.nonIdempotentWindowSeconds ?? 120),
 		logFile: process.env.PI_MUSE_LOG ?? file.logFile ?? join(homedir(), ".pi", "agent", "muse-turns.log"),
 		syncAutoApply: (process.env.PI_MUSE_SYNC_AUTO_APPLY ?? String(file.syncAutoApply ?? "")) === "1" || String(file.syncAutoApply) === "true",
 	};
@@ -628,7 +631,7 @@ const MUSE_ERRORS: [RegExp, string][] = [
 function describeMuseError(error: unknown): Error {
 	let msg = error instanceof Error ? error.message : String(error);
 	for (const [re, en] of MUSE_ERRORS) if (re.test(msg)) msg = `${msg} (${en})`;
-	if (!/aborted|Not auto-continuing|gave up/i.test(msg)) msg += ". The Muse turn was interrupted; send a follow-up such as \"continue\" to resume in the same Muse thread.";
+	if (!/aborted|Not auto-continuing|gave up|NOT sent/i.test(msg)) msg += ". The Muse turn was interrupted; send a follow-up such as \"continue\" to resume in the same Muse thread.";
 	return new Error(msg);
 }
 
@@ -661,12 +664,15 @@ interface LiveTurn {
 	retries: number;
 	lastStep?: LastStep;
 	startedAt: number;
+	note?: string;
+	attachTimer?: ReturnType<typeof setTimeout>;
+	cancelledByUs?: boolean;
 }
 let live: LiveTurn | undefined;
 /** at most one in-flight request per Muse thread */
 export const threadLock = new ThreadLock();
 /** test hook: counts of what the extension did */
-export const stats = { continuations: 0, presented: 0, stopped: 0, rejected: 0 };
+export const stats = { continuations: 0, presented: 0, stopped: 0, rejected: 0, attached: 0, guarded: 0 };
 
 class LockRejected extends Error {}
 
@@ -679,8 +685,11 @@ function lastTodo(msgs: any[]): string | undefined {
 	return undefined;
 }
 
+/** identifies this Pi process to muse2api (server-side per-thread lock / attach ownership) */
+export const CLIENT_ID = randomUUID();
+
 function turnBody(base: any, cfg: MuseConfig) {
-	const b = { ...base };
+	const b = { ...base, client_id: CLIENT_ID };
 	if (cfg.firstByteTimeout) b.first_byte_timeout = cfg.firstByteTimeout;
 	if (cfg.idleTimeout) b.idle_timeout = cfg.idleTimeout;
 	return b;
@@ -698,8 +707,44 @@ async function openTurn(cfg: MuseConfig, apiKey: string, body: any, ctl: AbortCo
 	} catch (e) {
 		throw Object.assign(new Error(`muse2api request failed: ${(e as any)?.cause?.code ?? ""} ${(e as any)?.message ?? e}`.trim()), { name: (e as any)?.name });
 	}
+	if (res.status === 409) {
+		const j: any = await res.json().catch(() => ({}));
+		throw Object.assign(
+			new Error(`Muse thread ${body.session_id ?? ""} is busy: another request (${j.phase ?? "running"}${j.owner_is_you ? "" : ", started from another Pi window"}) is still in flight. Your message was NOT sent; wait for it to finish and send again.`),
+			{ httpStatus: 409, busy: true },
+		);
+	}
 	if (!res.ok || !res.body) throw Object.assign(new Error(`muse2api HTTP ${res.status}: ${(await res.text()).slice(0, 300)}`), { httpStatus: res.status });
 	return sse(res);
+}
+
+async function openAttach(cfg: MuseConfig, session: string, ctl: AbortController) {
+	const res = await fetch(`${cfg.baseUrl}/pi/v1/thread/attach`, {
+		method: "POST",
+		headers: { "content-type": "application/json", authorization: `Bearer ${cfg.apiKey}` },
+		body: JSON.stringify({ session_id: session, client_id: CLIENT_ID }),
+		signal: ctl.signal,
+	});
+	if (!res.ok || !res.body) throw Object.assign(new Error(`attach HTTP ${res.status}: ${(await res.text()).slice(0, 200)}`), { httpStatus: res.status });
+	return sse(res);
+}
+
+function recoveryDeps(cfg: MuseConfig, signal: AbortSignal | undefined, think: (s: string) => void) {
+	return {
+		getState: (sid: string) => backendWith(cfg, "/pi/v1/thread/state", { session_id: sid, client_id: CLIENT_ID }),
+		cancel: (sid: string) => backendWith(cfg, "/pi/v1/thread/cancel", { session_id: sid, client_id: CLIENT_ID }),
+		sleep: (ms: number) => sleep(ms, signal),
+		log: (ev: string, d: Record<string, unknown>) => {
+			logTurn(cfg, ev, d);
+			if (ev === "thread_state" && d.status === "running") think("… Muse is still working on this thread; waiting for it\n");
+			if (ev === "thread_cancel") think("… Muse turn exceeded the max wait; cancelling it\n");
+		},
+		aborted: () => !!signal?.aborted,
+	};
+}
+
+function waitCfg(cfg: MuseConfig) {
+	return { autoContinue: true, maxRetries: cfg.maxRetries, backoffMs: [], maxWaitMs: cfg.maxWaitSeconds * 1000, pollMs: cfg.pollSeconds * 1000 };
 }
 
 async function backendWith(cfg: MuseConfig, path: string, body: unknown): Promise<any> {
@@ -745,7 +790,12 @@ export function streamLocal(model: Model<Api>, context: TranscriptContext, optio
 		try {
 			const msgs = context.messages as any[];
 			const last = msgs[msgs.length - 1];
-			const onAbort = () => live?.ctl.abort();
+			const onAbort = () => {
+				const cur = live;
+				cur?.ctl.abort();
+				// Esc means stop: the muse2api request ending would otherwise leave Muse running in the background
+				if (cur?.session) backendWith(cfg, "/pi/v1/thread/cancel", { session_id: cur.session, client_id: CLIENT_ID }).catch(() => {});
+			};
 			options?.signal?.addEventListener("abort", onAbort, { once: true });
 			if (last?.role === "toolResult" && live) {
 				// hand the results of Pi's local tool runs back to Muse
@@ -757,7 +807,7 @@ export function streamLocal(model: Model<Api>, context: TranscriptContext, optio
 					if (!rid) continue;
 					live.pending.delete(r.toolCallId);
 					const text = textOf(r.content) || "(no output)";
-					if (live.lastStep) Object.assign(live.lastStep, { status: r.isError ? "error" : "ok", result: summarize(text, 300) });
+					if (live.lastStep) Object.assign(live.lastStep, { status: r.isError ? "error" : "ok", result: summarize(text, 300), finishedAt: Date.now() });
 					await postResult(cfg, live.turnId, rid, !r.isError, text);
 				}
 			} else if (last?.role === "toolResult") {
@@ -810,8 +860,31 @@ export function streamLocal(model: Model<Api>, context: TranscriptContext, optio
 				const ctl = new AbortController();
 				live = { it: undefined as any, ctl, reply: "", session: sessionId, pending: new Map(), tools, seenTools: new Set(), ctx: hash, owner, payload, retries: 0, startedAt: Date.now() };
 				turn = live;
-				live.it = await openTurn(cfg, options?.apiKey || cfg.apiKey, payload, ctl);
 				e.start();
+				if (sessionId) {
+					// state check before EVERY send: never put a second request into a thread that is still running
+					live.recovering = true;
+					const pre = await recoverTurn(sessionId, waitCfg(cfg), recoveryDeps(cfg, options?.signal, (x) => e.think(x)), { foreignIsBusy: true, noCancel: true });
+					live.recovering = false;
+					logTurn(cfg, "preflight", { session: sessionId, ...pre });
+					if (pre.action === "stop") {
+						stats.stopped++;
+						throw Object.assign(new Error(`Your message was NOT sent: ${pre.reason}. Wait for it to finish and send again.`), { preflight: true });
+					}
+					if (pre.action === "attach") {
+						stats.attached++;
+						e.think("⇄ Muse is still working on the previous turn of this thread; attached to it instead of sending your message\n");
+						live.note = "(Muse was still finishing the previous turn, so your message was not sent; this is that turn's result. Send your message again if it is still needed.)";
+						live.it = await openAttach(cfg, sessionId, ctl);
+					} else if (pre.action === "present" && pre.wasRunning) {
+						stats.presented++;
+						live.reply = pre.reply;
+						live.note = "(Muse was still finishing the previous turn, so your message was not sent; this is that turn's result. Send your message again if it is still needed.)";
+						live.it = (async function* () {})();
+						live.gotDone = true;
+					}
+				}
+				if (!live.it) live.it = await openTurn(cfg, options?.apiKey || cfg.apiKey, payload, ctl);
 				e.think(`Muse is working on ${basename(cwd)} through the local device bridge…\n`);
 			}
 
@@ -840,17 +913,7 @@ export function streamLocal(model: Model<Api>, context: TranscriptContext, optio
 					t.retries++;
 					e.think(`⟳ Muse turn interrupted (${cls.reason}); checking thread state in ${delay / 1000}s (auto-continue ${t.retries}/${cfg.maxRetries})…\n`);
 					await sleep(delay, options?.signal);
-					const r = await recoverTurn(t.session, { autoContinue: true, maxRetries: cfg.maxRetries, backoffMs: [], maxWaitMs: cfg.maxWaitSeconds * 1000, pollMs: cfg.pollSeconds * 1000 }, {
-						getState: (sid) => backendWith(cfg, "/pi/v1/thread/state", { session_id: sid }),
-						cancel: (sid) => backendWith(cfg, "/pi/v1/thread/cancel", { session_id: sid }),
-						sleep: (ms) => sleep(ms, options?.signal),
-						log: (ev, d) => {
-							logTurn(cfg, ev, d);
-							if (ev === "thread_state" && d.status === "running") e.think("… Muse is still working on the interrupted turn; waiting for it\n");
-							if (ev === "thread_cancel") e.think("… Muse turn exceeded the max wait; cancelling it\n");
-						},
-						aborted: () => !!options?.signal?.aborted,
-					});
+					const r = await recoverTurn(t.session, waitCfg(cfg), recoveryDeps(cfg, options?.signal, (x) => e.think(x)), { foreignIsBusy: true });
 					logTurn(cfg, "recovery", { session: t.session, ...r });
 					if (r.action === "stop") {
 						stats.stopped++;
@@ -860,6 +923,39 @@ export function streamLocal(model: Model<Api>, context: TranscriptContext, optio
 						stats.presented++;
 						e.think(`✓ Muse finished the interrupted turn on its own (after ${Math.round(r.waitedMs / 1000)}s); showing its result\n`);
 						return r.reply;
+					}
+					if (r.action === "attach") {
+						stats.attached++;
+						e.think("⇄ muse2api kept the Muse page and device online; re-attaching to the running turn (nothing re-sent)\n");
+						t.ctl.abort();
+						t.ctl = new AbortController();
+						t.gotDone = false;
+						t.pending = new Map();
+						try {
+							t.it = await openAttach(cfg, t.session!, t.ctl);
+						} catch (e2) {
+							return await recover(e2);
+						}
+						// bounded wait: past maxWaitSeconds ask muse2api to cancel the held turn (it then reports done/interrupted)
+						if (t.attachTimer) clearTimeout(t.attachTimer);
+						t.attachTimer = setTimeout(() => {
+							t.cancelledByUs = true;
+							logTurn(cfg, "thread_cancel", { session: t.session, reason: "max wait while attached" });
+							e.think("… Muse turn exceeded the max wait; cancelling it\n");
+							backendWith(cfg, "/pi/v1/thread/cancel", { session_id: t.session, client_id: CLIENT_ID }).catch(() => {});
+						}, cfg.maxWaitSeconds * 1000);
+						return undefined;
+					}
+					const ls = t.lastStep;
+					if (ls?.nonIdempotent && ls.finishedAt && Date.now() - ls.finishedAt < cfg.nonIdempotentWindowSeconds * 1000) {
+						stats.guarded++;
+						logTurn(cfg, "guard_stop", { session: t.session, last_step: ls });
+						throw Object.assign(
+							new Error(
+								`${err?.message ?? err}. Not auto-continuing: the turn broke right after a non-idempotent step (${ls.tool} ${summarize(ls.args, 120)}: ${ls.nonIdempotent}). Check its effect, then send "continue" to resume in the same Muse thread`,
+							),
+							{ noHint: true },
+						);
 					}
 					const msg = continuationMessage(t.lastStep, todo);
 					stats.continuations++;
@@ -915,7 +1011,13 @@ export function streamLocal(model: Model<Api>, context: TranscriptContext, optio
 					t.pending.set(id, data.request_id);
 					t.retries = 0;
 					const args = decodeArgs(tool, data.params ?? {});
-					t.lastStep = { tool: data.command, args, status: "pending" };
+					let existed: boolean | undefined;
+					try {
+						if (typeof (args as any).path === "string") existed = existsSync(resolve(process.cwd(), (args as any).path));
+					} catch {
+						existed = undefined;
+					}
+					t.lastStep = { tool: data.command, args, status: "pending", nonIdempotent: nonIdempotentReason(data.command, args, existed) };
 					if (t.session) output.responseId = `muse:${t.session}#ctx=${t.ctx}`;
 					e.toolCall(id, data.command, args);
 					options?.signal?.removeEventListener("abort", onAbort);
@@ -931,8 +1033,15 @@ export function streamLocal(model: Model<Api>, context: TranscriptContext, optio
 						threadLock.tryAcquire(t.session!, t.owner);
 					}
 				} else if (event === "done") {
-					t.gotDone = true;
 					t.session = data.session_id ?? t.session;
+					if (t.attachTimer) clearTimeout(t.attachTimer);
+					if (data.status && data.status !== "completed" && t.cancelledByUs) {
+						t.cancelledByUs = false;
+						presented = await recover(Object.assign(new Error(`Muse turn cancelled after the max wait (${cfg.maxWaitSeconds}s)`), { code: "max_wait_timeout" }));
+						if (presented !== undefined) break;
+						continue;
+					}
+					t.gotDone = true;
 				} else if (event === "error") {
 					presented = await recover(Object.assign(new Error(data.message ?? "muse2api error"), data));
 					if (presented !== undefined) break;
@@ -945,6 +1054,8 @@ export function streamLocal(model: Model<Api>, context: TranscriptContext, optio
 				}
 			}
 			if (presented !== undefined) t.reply = presented;
+			if (t.attachTimer) clearTimeout(t.attachTimer);
+			if (t.note) t.reply = `${t.note}\n\n${t.reply}`;
 			threadLock.release(t.session, t.owner);
 			t.ctl.abort();
 			live = undefined;
@@ -961,6 +1072,7 @@ export function streamLocal(model: Model<Api>, context: TranscriptContext, optio
 			const cur = turn ?? live;
 			if (cur?.session) output.responseId = `muse:${cur.session}#ctx=${cur.ctx}`;
 			if (cur) {
+				if (cur.attachTimer) clearTimeout(cur.attachTimer);
 				threadLock.release(cur.session, cur.owner);
 				cur.recovering = false;
 				cur.ctl.abort();

@@ -195,34 +195,49 @@ Non-interactive: `pi -p --model muse/auto/auto "…" < /dev/null` (or `--mode js
 | `PI_MUSE_POLL` | `pollSeconds` | `5`: thread-state poll interval while waiting |
 | `PI_MUSE_FIRST_BYTE_TIMEOUT` | `firstByteTimeout` | unset (backend default); per-turn override, mainly for tests |
 | `PI_MUSE_IDLE_TIMEOUT` | `idleTimeout` | unset (backend default) |
+| `PI_MUSE_NON_IDEMPOTENT_WINDOW` | `nonIdempotentWindowSeconds` | `120`: never auto-continue if the turn broke within this many seconds after a non-idempotent device step |
 | `PI_MUSE_LOG` | `logFile` | `~/.pi/agent/muse-turns.log`: JSON lines of turn errors and recovery decisions |
 
 ## Interrupted turns and auto-continue (`local` mode)
 
-A long multi-tool turn can be cut off by a muse2api timeout or a dropped connection. pi-muse then recovers
-on its own, in the **same Muse thread**, without re-sending your prompt:
+A long multi-tool turn can be cut off by a muse2api timeout or a dropped connection. pi-muse recovers on its
+own, in the **same Muse thread**, without re-sending your prompt.
+
+**The page and device outlive the request.** A muse2api timeout ends only the HTTP request. muse2api keeps
+the muse.ai page open, so the Pi device stays registered and online, and a watcher checks the thread state
+(`sessions.get`) every few seconds. The page is closed only when the thread is `completed` / `interrupted`,
+after a short grace period in which a follow-up turn reuses it, so there is never a second device per thread.
 
 1. **Classify.** Only transient failures are retried: muse2api timeouts (`code` ending in `_timeout`, or the
    messages `等待助手首字响应超时` / `等待助手回复超时`), HTTP 504, and mid-stream disconnects (`terminated`,
    `fetch failed`, `ECONNRESET`, stream ended without `done`). Auth (401/403, cookie/login), quota/rate-limit
-   (429, quota, credits), refusal/content-policy and user aborts stop immediately and are reported.
-2. **Check the Muse thread first.** A muse2api timeout only ends muse2api's wait; the Muse turn keeps running on
-   muse.ai (verified: `sessions.get` keeps reporting `running`). pi-muse polls `/pi/v1/thread/state` and
-   - if Muse is still running, **waits** (up to `maxWaitSeconds`);
-   - if Muse then finished on its own, shows **its result** and sends nothing;
-   - if it is still running after the max wait, cancels it (`chat.cancel`) and continues only once the thread
-     reports a non-running state;
-   - if the state cannot be determined (endpoint missing/failing, unknown status, no thread id yet), it
-     **stops and reports**; it never guesses.
-3. **Continue.** Otherwise it sends only a short continuation message, e.g.
+   (429, quota, credits), refusal/content-policy, busy (409) and user aborts stop immediately and are reported.
+2. **Check the thread state** (`/pi/v1/thread/state`):
+   - if muse2api still holds the turn for this Pi, **re-attach** to its stream: buffered and new device calls
+     are delivered and run normally, Muse's final answer is shown, and nothing is re-sent;
+   - if Muse is running but not held (for example, muse2api restarted), **wait** up to `maxWaitSeconds` and then
+     show Muse's result. If it is still running after that, cancel it (`chat.cancel`) and continue only once
+     the thread reports a non-running state. A turn that is attached but runs longer than `maxWaitSeconds` is
+     cancelled the same way;
+   - if the turn is held for another Pi window, stop: the thread is busy;
+   - if the state cannot be determined, **stop and report**; it never guesses.
+3. **Non-idempotent guard.** Device steps are classified when Muse requests them. Re-running them would change
+   state again: `>>` appends, `tee -a`, mutating `git` commands (push/commit/merge/reset/…), `rm`/`mv`, `sed -i`,
+   mutating `curl`/`wget` requests, package publish/install, `gh`/`kubectl`/`terraform`/`docker push`,
+   `ssh`/`scp`/`rsync`, database clients, `write` over an existing file, `edit`, and unknown tools. If the turn
+   broke within `nonIdempotentWindowSeconds` of such a step, pi-muse **stops and asks you** instead of sending a
+   continuation. Re-attaching is still allowed because it re-sends nothing.
+4. **Continue.** Otherwise it sends only a short continuation message, e.g.
    `Continue from where you stopped. The last step already ran: bash {"command":"echo step >> log.txt"} -> (no output). Do not repeat it.`
-   (plus your todo list if the transcript has a todo tool call), so a non-idempotent step is not repeated.
-4. **Limits.** At most `maxRetries` consecutive attempts with `backoffSeconds` delays, then a clear error.
+   (plus your todo list if the transcript has a todo tool call).
+5. **Limits.** At most `maxRetries` consecutive attempts with `backoffSeconds` delays, then a clear error.
    The counter resets when Muse makes progress (a device call or a reply).
-5. **One request per Muse thread.** While a turn is being recovered, a new prompt for the same thread
-   (e.g. a manual `continue`) is **rejected** with a message rather than queued: a queued `continue` would be
-   stale by the time the recovery finishes (it may already have presented Muse's result), so you decide again.
-   The lock is released in `finally` paths on success, error and crash.
+6. **State check before every send, one request per thread.** A new message on an existing thread (including a
+   manual `continue`) is checked first. If the thread is still running, pi-muse attaches or waits as above and
+   does **not** send your message; it says so. muse2api enforces the lock server-side across all Pi windows:
+   a second request for a busy thread gets HTTP 409, which pi-muse reports as "busy, your message was NOT sent".
+   Within one Pi, a message typed while a recovery is running is rejected rather than queued, because a queued
+   one would be stale. Pressing Esc also cancels the Muse turn.
 
 Every decision is logged as one JSON line in `logFile` (`turn_error` with code, message, phase, timeout,
 seconds waited, bytes/events received, thread id, last device step; `thread_state`, `thread_cancel`,
@@ -248,7 +263,8 @@ the assistant message's `responseId` as `muse:<thread>#ctx=<hash>`), so follow-u
 
 - **`local` mode runs Muse's commands on your machine.** Every `bash` / `write` / `edit` Muse asks for is executed by Pi in your cwd with your user's rights, exactly like any other Pi model. Use it on repos you are happy to let an agent change, and keep them under git.
 - **Muse decides whether to use the device.** pi-muse prepends a short instruction ("the project lives only on device …; use its commands, not your VM") to each prompt. In tests Muse followed it every time, but it is a prompt, not a guarantee; Muse may also use its own memory/web tools, which show up in the thinking block.
-- **Auto-continue cannot keep the device online while Muse runs on.** After a muse2api timeout the page (and with it the device node) is closed, so if Muse is still running it cannot reach your machine until the continuation; its device calls in that window fail on Muse's side. The real fix is the backend's activity-aware first-byte timeout (default 900 s of *silence*, reset by every gateway event / device call), which makes these timeouts rare.
+- **A held thread occupies the Muse account.** muse2api keeps one page per running thread until Muse finishes (hard cap 3600 s). It does not use the same account for other requests meanwhile (muse2api allows one page per account at a time).
+- **Device calls are only delivered while some Pi is attached.** After a timeout pi-muse re-attaches within the backoff (2 s by default). If no client attaches (for example, Pi was closed), Muse's device calls in that window time out on Muse's side after about 30 s.
 - **The device exists only during a turn.** muse2api opens the muse.ai page per turn, so the node is online only while Pi is waiting on Muse. Between turns it shows as offline in Muse's device list. Muse's node-invoke timeout is about 30 s per call, so very long `bash` commands can time out on Muse's side even though they finish locally.
 - **One machine, one node.** The node id is `pi-<hostname>`; the display name carries the repo name. Two Pi sessions on one machine at the same time would share it (muse2api serializes turns anyway).
 - **`xml` mode is slow.** Every tool round-trip is a full Muse turn (~25–30 s), and long tool outputs are pasted into the chat.

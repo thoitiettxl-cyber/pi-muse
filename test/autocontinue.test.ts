@@ -84,3 +84,20 @@ test("recover: unknown state -> stop", async () => {
 	assert.equal((await recoverTurn(undefined, cfg, deps([{ status: "interrupted" }]))).action, "stop");
 	assert.equal((await recoverTurn("s", cfg, deps([{ status: "running" }], () => { throw new Error("no cancel"); }))).action, "stop");
 });
+
+import { nonIdempotentReason } from "../src/autocontinue.ts";
+test("non-idempotent classification", () => {
+	const yes: [string, any, boolean?][] = [
+		["bash", { command: "echo x >> log.txt" }], ["bash", { command: "git push origin main" }], ["bash", { command: "git commit -am x" }],
+		["bash", { command: "rm -rf build" }], ["bash", { command: "cd a && mv x y" }], ["bash", { command: "sed -i 's/a/b/' f" }],
+		["bash", { command: "curl -X POST https://api.example.com/x" }], ["bash", { command: "curl -d a=1 https://x" }], ["bash", { command: "npm publish" }],
+		["bash", { command: "gh pr create --fill" }], ["bash", { command: "kubectl apply -f x.yaml" }], ["bash", { command: "ssh host ls" }],
+		["bash", { command: "ls | tee -a out" }], ["write", { path: "a" }, true], ["edit", { path: "a" }], ["deploy_tool", {}],
+	];
+	for (const [t, a, ex] of yes) assert.ok(nonIdempotentReason(t, a, ex), `${t} ${JSON.stringify(a)}`);
+	const no: [string, any, boolean?][] = [
+		["read", { path: "a" }], ["ls", {}], ["grep", { pattern: "x" }], ["bash", { command: "ls -la" }], ["bash", { command: "git status && git diff" }],
+		["bash", { command: "curl https://example.com" }], ["bash", { command: "cat a > /dev/null" }], ["write", { path: "new.txt" }, false], ["bash", { command: "npm test" }],
+	];
+	for (const [t, a, ex] of no) assert.equal(nonIdempotentReason(t, a, ex), undefined, `${t} ${JSON.stringify(a)}`);
+});

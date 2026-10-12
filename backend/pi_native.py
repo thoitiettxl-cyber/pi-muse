@@ -31,7 +31,11 @@ def _ts(v) -> float | None:
         return None
 
 from fastapi import Body, Depends, HTTPException
-from fastapi.responses import StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse
+
+from pi_host import Registry, ThreadHost, sse_from_host
+
+HOSTS_REG: dict = {}
 
 GW = "window.__hatchEarlyGatewayRuntimeState.activeRuntime.getSnapshot()"
 
@@ -174,14 +178,14 @@ def register(app, g):
     GEN_LOCK = g["GEN_LOCK"]; auth = g["auth"]; CFG = g["CFG"]; log = g["log"]
     renew = g["_renew_and_persist"]; sync_cookies = g["_sync_cookies"]
     model_cache: dict = {}
-    TURNS: dict = {}   # turn_id -> queue of node invoke results posted by the Pi client
 
     @app.post("/pi/v1/invoke_result")
     def pi_invoke_result(body: dict = Body(...), _=Depends(auth)):
-        tq = TURNS.get(body.get("turn_id") or "")
-        if tq is None:
+        reg = HOSTS_REG.get("reg")
+        h = reg.by_turn.get(body.get("turn_id") or "") if reg else None
+        if h is None or h.closed.is_set():
             raise HTTPException(404, "unknown or finished turn")
-        tq.put(body)
+        h.results.put(body)
         return {"ok": True}
 
 
@@ -243,8 +247,18 @@ def register(app, g):
         sid = body.get("session_id")
         if not sid:
             raise HTTPException(400, "session_id required")
+        h = HOSTS_REG["reg"].get(sid) if HOSTS_REG.get("reg") else None
+        if h is not None:
+            try:
+                st = {"status": h.ops.status(h, sid)} if h.page_open else {"status": "running" if h.busy else h.last_status}
+            except Exception as e:  # noqa: BLE001
+                st = {"status": None, "error": str(e)}
+            st.update(h.info(body.get("client_id")))
+            log.info("pi_thread_state %s", json.dumps({"session_id": sid, "status": st.get("status"), "held": True}))
+            return st
         def fn(p):
             st = session_status(p, sid)
+            st["held"] = False
             if st["status"] and st["status"] != "running" and body.get("with_reply", True):
                 try:
                     st["reply"] = reply_after_last_user(p, sid)
@@ -261,6 +275,11 @@ def register(app, g):
         sid = body.get("session_id")
         if not sid:
             raise HTTPException(400, "session_id required")
+        h = HOSTS_REG["reg"].get(sid) if HOSTS_REG.get("reg") else None
+        if h is not None:
+            r = h.request_cancel(wait=True)
+            log.warning("pi_thread_cancel %s", json.dumps({"session_id": sid, "held": True, **r}))
+            return r
         def fn(p):
             r = gw_call(p, "chat.cancel", {"session_id": sid}, timeout=20) or {}
             time.sleep(1.5)
@@ -363,260 +382,284 @@ def register(app, g):
     def pi_node_unpair(body: dict = Body(...), _=Depends(auth)):
         return with_page(lambda p: gw_call(p, "node.unpair", {"node_id": body.get("node_id")}))
 
+    # ------------------------------------------------------------------ thread hosts
+    REG = Registry(log)
+    HOSTS_REG["reg"] = REG
+
+    @app.on_event("shutdown")
+    def _pi_hosts_shutdown():
+        REG.close_all("muse2api shutdown")
+
+    def host_cfg(TO):
+        return {"cap": TO["turn"], "watch": _envf("PI_NATIVE_WATCH_INTERVAL", 3),
+                "grace": _envf("PI_NATIVE_HOLD_GRACE", 10), "heartbeat": TO["heartbeat"],
+                "reaper_slack": _envf("PI_NATIVE_REAPER_SLACK", 60), "cancel_wait": 30}
+
+    class RealOps:
+        """Page operations for a ThreadHost, backed by muse2api's engine (runs on the host thread)."""
+
+        def __init__(self, body, TO, acc):
+            self.body, self.TO, self.acc = body, TO, acc
+            self.node = body.get("node")
+            self.page = None; self.ctx_id = None; self.prev_model = None
+            self.state = {"goal_seen": False, "goal_done": False, "last_ev": time.time(), "events": 0,
+                          "bytes": 0, "last_invoke": None, "last_result": None}
+            self.t_turn = time.time()
+            self.page_lock = threading.RLock()
+
+        def open(self, host):
+            acc_id = self.acc["id"]; cookies = self.acc["cookies"]; exp = self.acc.get("cookies_exp")
+            POOL.acquire(account_id=acc_id, timeout=self.TO["turn"])
+            self.pool_held = True
+            if not GEN_LOCK.acquire(timeout=self.TO["turn"]):
+                raise TimeoutError("connect_timeout: no free browser slot")
+            self.gen_held = True
+            fresh = renew(acc_id, wake_vm=True)
+            if fresh:
+                cookies = fresh["cookies"]; exp = fresh.get("cookies_exp")
+            self.cookies, self.exp = cookies, exp
+            engine.start()
+            page = engine.ensure_page(cookies, exp, account_id=acc_id)
+            self.page = page; self.ctx_id = engine.current_context_id
+            sid = host.session
+            if sid:
+                page.send("Page.navigate", {"url": f"https://muse.ai/thread/{sid}"})
+                time.sleep(1.0)
+                engine._wait_ws_ready(page, timeout=self.TO["connect"])
+            if not wait_gateway(page, timeout=self.TO["connect"]):
+                host.emit({"type": "warning", "message": f"Muse gateway not ready after {self.TO['connect']:.0f}s (connect timeout); continuing"})
+            page.js(TAP_JS)
+            if self.node:
+                end_n = time.time() + self.TO["connect"]; err = None
+                while time.time() < end_n:
+                    try:
+                        gw_call(page, "node.register", self.node); err = None; break
+                    except Exception as e:  # noqa: BLE001
+                        err = e; time.sleep(0.5)
+                host.emit({"type": "node", "registered": err is None, "error": str(err) if err else None})
+
+        def _model(self, host):
+            model = self.body.get("model")
+            if not model:
+                return
+            try:
+                pm = (gw_call(self.page, "model.get", {}) or {}).get("selected_model")
+                if pm != model and self.prev_model is None:
+                    self.prev_model = pm
+                r = gw_call(self.page, "model.set", {"model": model})
+                host.emit({"type": "model", "selected": (r or {}).get("selected_model"), "display_name": (r or {}).get("display_name")})
+            except Exception as e:  # noqa: BLE001
+                host.emit({"type": "warning", "message": f"model.set failed: {e}"})
+
+        # pump: node keep-alive, invoke results, gateway events (runs for the whole host lifetime)
+        def pump(self, host):
+            page, node, st = self.page, self.node, self.state
+            if page is None:
+                return
+            now = time.time()
+            if node and now - getattr(self, "_last_reg", 0) > 4:
+                self._last_reg = now
+                try:
+                    gw_call(page, "node.register", node, timeout=10)
+                    gw_call(page, "node.heartbeat", {"node_id": node["node_id"]}, timeout=10)
+                except Exception as e:  # noqa: BLE001
+                    host.emit({"type": "warning", "message": f"node re-register: {e}"})
+            while True:
+                try:
+                    res = host.results.get_nowait()
+                except queue.Empty:
+                    break
+                self._send_result(host, res)
+            self._drain(host)
+
+        def _send_result(self, host, res):
+            ok = bool(res.get("ok", True)); payload = res.get("payload")
+            inner = {"ok": ok}
+            if ok:
+                inner["payload_json"] = json.dumps(payload, ensure_ascii=False)
+            else:
+                inner["error"] = {"code": res.get("code") or "tool_error", "message": str(res.get("error") or "failed")}
+            self.state["last_result"] = {"request_id": res.get("request_id"), "ok": ok, "result": summarize(payload if ok else res.get("error"))}
+            self.state["last_ev"] = time.time()
+            try:
+                r = gw_call(self.page, "nodes.invoke_result", {"request_id": res["request_id"], "node_id": self.node["node_id"], "result": inner}, timeout=20)
+                host.emit({"type": "invoke_ack", "request_id": res["request_id"], "response": r})
+            except Exception as e:  # noqa: BLE001
+                host.emit({"type": "warning", "message": f"nodes.invoke_result failed: {e}"})
+
+        def _drain(self, host):
+            st, node, body = self.state, self.node, self.body
+            try:
+                self.page.js(TAP_JS)
+                frames = json.loads(self.page.js(DRAIN_JS) or "[]")
+            except Exception:
+                return
+            for fr in frames:
+                for line in fr.splitlines():
+                    try:
+                        ev = json.loads(line)
+                    except Exception:
+                        continue
+                    if isinstance(ev, dict) and ev.get("method") == "node.invoke.request":
+                        pr = ev.get("params") or {}
+                        if node and pr.get("node_id") == node.get("node_id"):
+                            host.emit({"type": "invoke", "turn_id": host.tid, "request_id": pr.get("request_id") or ev.get("id"),
+                                       "command": pr.get("command"), "params": pr.get("params") or {}, "timeout_ms": pr.get("timeout_ms")})
+                            st["last_ev"] = time.time(); st["events"] += 1
+                            st["last_invoke"] = {"request_id": pr.get("request_id") or ev.get("id"), "command": pr.get("command"),
+                                                 "args": summarize(pr.get("params") or {}), "at": time.strftime("%Y-%m-%dT%H:%M:%S%z")}
+                        continue
+                    if not isinstance(ev, dict) or ev.get("type") != "event":
+                        continue
+                    if body.get("debug_events"):
+                        host.emit({"type": "raw_event", "event": ev.get("event"), "payload": ev.get("payload")})
+                    for rec in normalize(ev):
+                        ts = _ts(rec.get("created_at") or rec.get("timestamp"))
+                        if rec["type"] in ("tool", "activity") and ts is not None and ts < self.t_turn - 5:
+                            continue
+                        if rec["type"] == "session" and rec.get("session_id"):
+                            if rec["change"] == "created" or not host.session:
+                                host.set_session(rec["session_id"])
+                        if rec["type"] == "activity":
+                            st["goal_seen"] = True; st["goal_done"] = rec["finished"]
+                        st["last_ev"] = time.time(); st["events"] += 1
+                        host.emit(rec)
+
+        def stream(self, host, prompt):
+            self.t_turn = time.time()
+            self.state.update({"goal_seen": False, "goal_done": False, "last_ev": time.time(), "bytes": 0})
+            self._model(host)
+            engine.first_token_timeout = self.TO["first_byte"]
+            engine.idle_timeout = self.TO["idle"]
+            engine.activity_fn = (lambda: self.state["last_ev"]) if self.node else None
+            try:
+                for chunk in engine.chat_stream(self.cookies, prompt, self.exp, int(self.TO["turn"]),
+                                                account_id=self.acc["id"], stop_event=host.stop_stream):
+                    self.state["bytes"] += len(chunk.encode())
+                    yield chunk
+            finally:
+                if not host.session:
+                    try:
+                        href = self.page.js("location.pathname") or ""
+                        if href.startswith("/thread/") and href != "/thread/new":
+                            host.set_session(href.split("/")[2])
+                    except Exception:
+                        pass
+
+        def settle(self, host):
+            settle = float(self.body.get("settle_timeout") or 45)
+            t_end = time.time() + settle; first_quiet = time.time() + 6
+            while time.time() < t_end and not host.cancel_req.is_set():
+                if self.state["goal_done"] and time.time() - self.state["last_ev"] > 1.5:
+                    break
+                if not self.state["goal_seen"] and time.time() > first_quiet:
+                    break
+                time.sleep(0.4)
+            if not host.session:
+                try:
+                    href = self.page.js("location.pathname") or ""
+                    if href.startswith("/thread/") and href != "/thread/new":
+                        host.set_session(href.split("/")[2])
+                except Exception:
+                    pass
+
+        def status(self, host, sid):
+            return session_status(self.page, sid)["status"]
+
+        def cancel(self, host, sid):
+            return gw_call(self.page, "chat.cancel", {"session_id": sid}, timeout=20)
+
+        def reply(self, host, sid):
+            return reply_after_last_user(self.page, sid)
+
+        def after_turn(self, host):
+            if self.prev_model and self.body.get("restore_model", True):
+                try:
+                    gw_call(self.page, "model.set", {"model": self.prev_model})
+                except Exception:
+                    pass
+                self.prev_model = None
+            store.mark(self.acc["id"], True, "")
+            try:
+                sync_cookies(self.acc["id"])
+            except Exception:
+                pass
+
+        def error_details(self, host):
+            s = self.state
+            return {"bytes_received": s["bytes"], "events_received": s["events"],
+                    "last_invoke": s["last_invoke"], "last_result": s["last_result"]}
+
+        def close(self, host):
+            # may run on the reaper thread: close by handle, not via the engine's thread-local page
+            try:
+                if self.page is not None:
+                    self.page.close()
+            except Exception:
+                pass
+            try:
+                if self.ctx_id and engine.browser:
+                    engine.browser.send("Target.disposeBrowserContext", {"browserContextId": self.ctx_id})
+                    with engine._contexts_lock:
+                        engine._active_contexts.discard(self.ctx_id)
+            except Exception:
+                pass
+            self.page = None
+            if threading.current_thread() is host.thread:
+                try:
+                    engine.page = None; engine.current_context_id = None; engine.current_acc_id = None
+                except Exception:
+                    pass
+                engine.first_token_timeout = 40.0; engine.idle_timeout = 0; engine.activity_fn = None
+            if getattr(self, "gen_held", False):
+                self.gen_held = False; GEN_LOCK.release()
+            if getattr(self, "pool_held", False):
+                self.pool_held = False; POOL.release(self.acc["id"])
+
     @app.post("/pi/v1/turn")
     def pi_turn(body: dict = Body(...), _=Depends(auth)):
         prompt = (body.get("prompt") or "").strip()
         if not prompt:
             raise HTTPException(400, "prompt is empty")
-        model = body.get("model")              # e.g. "auto/auto", "ipnext/avocado-5.16-v0"
-        session_id = body.get("session_id")    # continue an existing Muse thread
+        session_id = body.get("session_id")
+        client_id = body.get("client_id")
         TO = timeouts(body, bool(body.get("node")))
-        timeout = int(TO["turn"])
-        settle = float(body.get("settle_timeout") or 45)
-        acc = store.pick_account(rotate=True, preferred_id=getattr(engine, "current_acc_id", None))
-        if not acc:
-            raise HTTPException(400, "no Muse account imported in muse2api")
-        q: queue.Queue = queue.Queue()
-        stop = threading.Event()
         tid = "turn-" + uuid.uuid4().hex[:12]
-        results_q: queue.Queue = queue.Queue()
-        TURNS[tid] = results_q
-
-        def worker():
-            acc_id = acc["id"]; cookies = acc["cookies"]; exp = acc.get("cookies_exp")
-            POOL.acquire(account_id=acc_id, timeout=timeout)
-            seen_session = {"id": session_id}
-            t_start = time.time()
-            state = {"goal_seen": False, "goal_done": False, "last_ev": time.time(), "events": 0,
-                     "bytes": 0, "last_invoke": None, "last_result": None, "phase": "connect"}
-            try:
-                fresh = renew(acc_id, wake_vm=True)
-                if fresh:
-                    cookies = fresh["cookies"]; exp = fresh.get("cookies_exp")
-                with GEN_LOCK:
-                    engine.start()
-                    page = engine.ensure_page(cookies, exp, account_id=acc_id)
-                    if session_id:
-                        page.send("Page.navigate", {"url": f"https://muse.ai/thread/{session_id}"})
-                        time.sleep(1.0)
-                        engine._wait_ws_ready(page, timeout=TO["connect"])
-                    if not wait_gateway(page, timeout=TO["connect"]):
-                        q.put({"type": "warning", "message": f"Muse gateway not ready after {TO['connect']:.0f}s (connect timeout); continuing"})
-                    page.js(TAP_JS)
-                    node = body.get("node")
-                    if node:
-                        end_n = time.time() + TO["connect"]; err = None
-                        while time.time() < end_n:
-                            try:
-                                gw_call(page, "node.register", node); err = None; break
-                            except Exception as e:  # noqa: BLE001
-                                err = e; time.sleep(0.5)
-                        q.put({"type": "node", "registered": err is None, "error": str(err) if err else None})
-                    prev_model = None
-                    if model:
-                        try:
-                            prev_model = (gw_call(page, "model.get", {}) or {}).get("selected_model")
-                            if prev_model == model:
-                                prev_model = None
-                            r = gw_call(page, "model.set", {"model": model})
-                            q.put({"type": "model", "selected": (r or {}).get("selected_model"),
-                                   "display_name": (r or {}).get("display_name")})
-                        except Exception as e:  # noqa: BLE001
-                            q.put({"type": "warning", "message": f"model.set failed: {e}"})
-
-                    def drain():
-                        try:
-                            page.js(TAP_JS)   # re-install after any navigation
-                            frames = json.loads(page.js(DRAIN_JS) or "[]")
-                        except Exception:
-                            return
-                        for fr in frames:
-                            for line in fr.splitlines():
-                                try:
-                                    ev = json.loads(line)
-                                except Exception:
-                                    if body.get("debug_events") and "invoke" in line:
-                                        q.put({"type": "raw_frame", "text": line[:4000]})
-                                    continue
-                                if isinstance(ev, dict) and ev.get("method") == "node.invoke.request":
-                                    pr = ev.get("params") or {}
-                                    if node and pr.get("node_id") == node.get("node_id"):
-                                        q.put({"type": "invoke", "turn_id": tid, "request_id": pr.get("request_id") or ev.get("id"),
-                                               "command": pr.get("command"), "params": pr.get("params") or {},
-                                               "timeout_ms": pr.get("timeout_ms")})
-                                        state["last_ev"] = time.time(); state["events"] += 1
-                                        state["last_invoke"] = {"request_id": pr.get("request_id") or ev.get("id"),
-                                                                "command": pr.get("command"),
-                                                                "args": summarize(pr.get("params") or {}),
-                                                                "at": time.strftime("%Y-%m-%dT%H:%M:%S%z")}
-                                    continue
-                                if not isinstance(ev, dict) or ev.get("type") != "event":
-                                    if body.get("debug_events") and "invoke" in line:
-                                        q.put({"type": "raw_frame", "text": line[:4000]})
-                                    continue
-                                if body.get("debug_events"):
-                                    q.put({"type": "raw_event", "event": ev.get("event"), "payload": ev.get("payload")})
-                                for rec in normalize(ev):
-                                    # navigation into an existing thread replays old activity: drop it
-                                    ts = _ts(rec.get("created_at") or rec.get("timestamp"))
-                                    if rec["type"] in ("tool", "activity") and ts is not None and ts < t_start - 5:
-                                        continue
-                                    if rec["type"] == "session" and rec.get("session_id"):
-                                        if rec["change"] == "created" or not seen_session["id"]:
-                                            seen_session["id"] = rec["session_id"]
-                                    if rec["type"] == "activity":
-                                        state["goal_seen"] = True
-                                        state["goal_done"] = rec["finished"]
-                                    state["last_ev"] = time.time(); state["events"] += 1
-                                    q.put(rec)
-
-                    # text comes from the existing DOM streamer; events are drained in a side thread
-                    alive = threading.Event(); alive.set()
-                    def send_result(res):
-                        ok = bool(res.get("ok", True))
-                        payload = res.get("payload")
-                        inner = {"ok": ok}
-                        if ok:
-                            inner["payload_json"] = json.dumps(payload, ensure_ascii=False)
-                        else:
-                            inner["error"] = {"code": res.get("code") or "tool_error", "message": str(res.get("error") or "failed")}
-                        state["last_result"] = {"request_id": res.get("request_id"), "ok": ok,
-                                                "result": summarize(payload if ok else res.get("error"))}
-                        state["last_ev"] = time.time()
-                        params = {"request_id": res["request_id"], "node_id": node["node_id"], "result": inner}
-                        try:
-                            r = gw_call(page, "nodes.invoke_result", params, timeout=20)
-                            q.put({"type": "invoke_ack", "request_id": res["request_id"], "response": r})
-                        except Exception as e:  # noqa: BLE001
-                            q.put({"type": "warning", "message": f"nodes.invoke_result failed: {e}"})
-
-                    def pump():
-                        last_reg = 0.0
-                        while alive.is_set() and not stop.is_set():
-                            if node and time.time() - last_reg > 4:
-                                last_reg = time.time()
-                                try:
-                                    gw_call(page, "node.register", node, timeout=10)
-                                    gw_call(page, "node.heartbeat", {"node_id": node["node_id"]}, timeout=10)
-                                except Exception as e:  # noqa: BLE001
-                                    q.put({"type": "warning", "message": f"node re-register: {e}"})
-                            while True:
-                                try:
-                                    res = results_q.get_nowait()
-                                except queue.Empty:
-                                    break
-                                send_result(res)
-                            drain(); time.sleep(0.3)
-                    pt = threading.Thread(target=pump, daemon=True); pt.start()
-                    text = []
-                    engine.first_token_timeout = TO["first_byte"]
-                    engine.idle_timeout = TO["idle"]
-                    engine.activity_fn = (lambda: state["last_ev"]) if node else None
-                    state["phase"] = "first_byte"
-                    try:
-                        for chunk in engine.chat_stream(cookies, prompt, exp, timeout,
-                                                        account_id=acc_id, stop_event=stop):
-                            state["phase"] = "streaming"; state["bytes"] += len(chunk.encode())
-                            text.append(chunk)
-                            q.put({"type": "text", "delta": chunk})
-                    finally:
-                        alive.clear(); pt.join(2)
-                    state["phase"] = "settle"
-                    q.put({"type": "text_done", "text": "".join(text)})
-                    # Muse writes activity reports asynchronously after the reply; wait for them.
-                    t_end = time.time() + settle
-                    first_quiet = time.time() + 6
-                    while time.time() < t_end and not stop.is_set():
-                        drain()
-                        if state["goal_done"] and time.time() - state["last_ev"] > 1.5:
-                            break
-                        if not state["goal_seen"] and time.time() > first_quiet:
-                            break
-                        time.sleep(0.4)
-                    if not seen_session["id"]:
-                        try:
-                            href = page.js("location.pathname") or ""
-                            if href.startswith("/thread/") and href != "/thread/new":
-                                seen_session["id"] = href.split("/")[2]
-                        except Exception:
-                            pass
-                    # authoritative reply text from the transcript (the DOM stream can repeat bubbles)
-                    final_text = None
-                    if seen_session["id"]:
-                        try:
-                            h = gw_call(page, "chat.history", {"session_id": seen_session["id"]})
-                            evs = [e for e in (h or {}).get("chat_events") or []
-                                   if e.get("event_name") == "message.assistant"]
-                            if evs:
-                                # all assistant messages after the last user message of this turn
-                                allev = (h or {}).get("chat_events") or []
-                                last_user = max((i for i, e in enumerate(allev) if e.get("event_name") == "message.user"), default=-1)
-                                parts = [(e.get("payload") or {}).get("content") or e.get("display_text") or ""
-                                         for e in allev[last_user + 1:] if e.get("event_name") == "message.assistant"]
-                                final_text = "\n\n".join(p for p in parts if p) or None
-                        except Exception as e:  # noqa: BLE001
-                            q.put({"type": "warning", "message": f"chat.history failed: {e}"})
-                    if prev_model and body.get("restore_model", True):
-                        # model selection is account-wide on Muse; don't leak it into other muse2api clients
-                        try:
-                            gw_call(page, "model.set", {"model": prev_model})
-                        except Exception:
-                            pass
-                    if final_text:
-                        q.put({"type": "final_text", "text": final_text})
-                store.mark(acc_id, True, "")
-                try:
-                    sync_cookies(acc_id)
-                except Exception:
-                    pass
-                q.put({"type": "done", "session_id": seen_session["id"], "turn_id": tid})
-            except Exception as e:  # noqa: BLE001
-                now = time.time()
-                code = getattr(e, "code", None) or ("connect_timeout" if str(e).startswith("connect_timeout") else None)
-                rec = {"type": "error", "message": f"{type(e).__name__}: {e}", "code": code,
-                       "retryable": bool(code and code.endswith("_timeout")),
-                       "phase": getattr(e, "phase", None) or state["phase"],
-                       "timeout_s": getattr(e, "timeout_s", None), "waited_s": getattr(e, "waited_s", None),
-                       "elapsed_s": round(now - t_start, 1),
-                       "started_at": datetime.fromtimestamp(t_start).astimezone().isoformat(timespec="seconds"),
-                       "failed_at": datetime.fromtimestamp(now).astimezone().isoformat(timespec="seconds"),
-                       "bytes_received": state["bytes"], "events_received": state["events"],
-                       "session_id": seen_session["id"], "turn_id": tid,
-                       "last_invoke": state["last_invoke"], "last_result": state["last_result"],
-                       "muse_cancelled": False}
-                # the timeout only ends OUR wait; the Muse turn keeps running server-side (verified:
-                # sessions.get stays "running"). Report its state; the client decides wait/cancel.
-                if seen_session["id"]:
-                    try:
-                        rec["muse_status"] = session_status(engine.page, seen_session["id"])["status"]
-                    except Exception as e2:  # noqa: BLE001
-                        rec["muse_status"] = None; rec["muse_status_error"] = str(e2)
-                log.warning("pi turn failed: %s", e)
-                log.warning("pi_turn_error %s", json.dumps(rec, ensure_ascii=False))
-                q.put(rec)
-            finally:
-                POOL.release(acc_id)
-                engine.first_token_timeout = 40.0
-                engine.idle_timeout = 0
-                engine.activity_fn = None
-                TURNS.pop(tid, None)
-                engine.close_current_page()
-                q.put(None)
-
-        threading.Thread(target=worker, daemon=True).start()
-
-        def gen():
-            try:
-                yield "event: start\ndata: " + json.dumps({"turn_id": tid}) + "\n\n"
-                while True:
-                    try:
-                        rec = q.get(timeout=TO["heartbeat"])
-                    except queue.Empty:
-                        yield ": keep-alive\n\n"; continue
-                    if rec is None:
-                        break
-                    yield f"event: {rec['type']}\ndata: {json.dumps(rec, ensure_ascii=False)}\n\n"
-            finally:
-                stop.set()
-        return StreamingResponse(gen(), media_type="text/event-stream",
+        with REG.lock:
+            h = REG.get(session_id)
+            if h is not None:
+                # server-side per-thread lock: one in-flight request per Muse thread, across all clients
+                if h.submit(prompt, tid, client_id):
+                    log.warning("pi_host %s", json.dumps({"event": "page_reused", "session_id": session_id, "turn_id": tid}))
+                    return StreamingResponse(sse_from_host(h, TO["heartbeat"]), media_type="text/event-stream",
+                                             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+                log.warning("pi_host %s", json.dumps({"event": "busy_rejected", "session_id": session_id, "phase": h.phase}))
+                return JSONResponse(status_code=409, content={"error": "thread_busy", "session_id": session_id,
+                                                              "phase": h.phase, "turn_id": h.tid,
+                                                              "owner_is_you": bool(client_id and client_id == h.owner),
+                                                              "message": "Muse thread already has a turn in flight"})
+            acc = store.pick_account(rotate=True, preferred_id=getattr(engine, "current_acc_id", None))
+            if not acc:
+                raise HTTPException(400, "no Muse account imported in muse2api")
+            h = ThreadHost(REG, RealOps(body, TO, acc), client_id, host_cfg(TO), log, session_id=session_id)
+            h.start(prompt, tid)
+        return StreamingResponse(sse_from_host(h, TO["heartbeat"]), media_type="text/event-stream",
                                  headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+
+    @app.post("/pi/v1/thread/attach")
+    def pi_thread_attach(body: dict = Body(...), _=Depends(auth)):
+        """Re-attach to a held thread whose request timed out: streams buffered + live records (incl. invokes)."""
+        h = REG.get(body.get("session_id"))
+        if h is None:
+            raise HTTPException(404, "thread is not held by muse2api")
+        if body.get("client_id") != h.owner:
+            return JSONResponse(status_code=409, content={"error": "thread_busy", "owner_is_you": False,
+                                                          "message": "thread is held for another client"})
+        TO = timeouts(body, True)
+        log.warning("pi_host %s", json.dumps({"event": "attached", "session_id": h.session, "turn_id": h.tid}))
+        return StreamingResponse(sse_from_host(h, TO["heartbeat"], first={"type": "start", "turn_id": h.tid, "attached": True}),
+                                 media_type="text/event-stream", headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+
+    @app.get("/pi/v1/hosts")
+    def pi_hosts(_=Depends(auth)):
+        return [{"session_id": h.session, **h.info(None), "age_s": round(time.time() - h.started, 1)} for h in REG.open_hosts()]

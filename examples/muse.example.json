@@ -12,5 +12,6 @@
     10
   ],
   "maxWaitSeconds": 600,
-  "pollSeconds": 5
+  "pollSeconds": 5,
+  "nonIdempotentWindowSeconds": 120
 }

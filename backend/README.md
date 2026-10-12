@@ -9,7 +9,7 @@ account pool and VM keep-alive.
 ```bash
 cd /path/to/muse2api
 git checkout -b pi-native
-cp /path/to/pi-muse/backend/pi_native.py .
+cp /path/to/pi-muse/backend/pi_native.py /path/to/pi-muse/backend/pi_host.py .
 git apply /path/to/pi-muse/backend/muse2api-app.patch   # hook at the end of app.py + split, activity-aware timeouts in engine.py
 # restart muse2api (uvicorn app:app --host 127.0.0.1 --port 18610)
 ```
@@ -57,3 +57,24 @@ Thread state endpoints (used by pi-muse's auto-continue):
 | POST | `/pi/v1/thread/cancel` | `{session_id}` → `chat.cancel` → `{cancelled, message_id, status}` |
 
 SSE events: `start`, `node`, `model`, `session`, `activity`, `tool`, `invoke`, `invoke_ack`, `text`, `text_done`, `final_text`, `warning`, `raw`, `done`, `error`. See `../docs/PROTOCOL.md`.
+
+## Thread hosts (page/device lifecycle, `pi_host.py`)
+Each `/pi/v1/turn` runs in a **ThreadHost** that owns one muse.ai page (and the Pi device node) per Muse thread:
+
+- A timeout ends only the SSE request (`error` with `held: true`). The page, node heartbeat and event pump
+  keep running, and a watcher polls `sessions.get` every `PI_NATIVE_WATCH_INTERVAL` (3 s).
+- `POST /pi/v1/thread/attach {session_id, client_id}` re-attaches the owning client. It receives buffered and
+  new records, including `invoke`, so device calls succeed while detached.
+- When the thread leaves `running`, the host emits `final_text` + `done{status}` and keeps the page for
+  `PI_NATIVE_HOLD_GRACE` (10 s). A follow-up `/pi/v1/turn` for that thread in this window **reuses** the page;
+  otherwise the page is closed.
+- `/pi/v1/thread/cancel` on a held thread runs `chat.cancel`, waits until the status really leaves `running`,
+  then finishes and closes.
+- **Server-side lock:** a `/pi/v1/turn` for a thread whose host is busy gets **409**
+  `{"error":"thread_busy", phase, turn_id, owner_is_you}`.
+- **Leak protection:** the watcher enforces the turn cap (`PI_NATIVE_TURN_TIMEOUT`, 3600 s) with a cancel. A
+  reaper force-closes any host older than cap + `PI_NATIVE_REAPER_SLACK` (60 s), even if its threads hang. All
+  hosts are closed on muse2api shutdown.
+- `GET /pi/v1/hosts` lists the open hosts (debugging).
+
+Tests: `python -m unittest tests.test_pi_host` (fake Muse: device online flag, watcher, reaper, cancel, reuse).

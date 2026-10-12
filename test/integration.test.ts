@@ -5,7 +5,7 @@ import { existsSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
-import { stats, streamLocal, threadLock } from "../src/index.ts";
+import { CLIENT_ID, stats, streamLocal, threadLock } from "../src/index.ts";
 import { type MockOpts, startMock } from "./mock-muse2api.ts";
 
 const model: any = { id: "auto/auto", api: "muse-agent", provider: "muse" };
@@ -46,7 +46,7 @@ async function scenario(name: string, opts: MockOpts, env: Record<string, string
 	if (LOGDIR) writeFileSync(logFile, "");
 	Object.assign(process.env, {
 		PI_MUSE_CONFIG: join(dir, "none.json"), MUSE2API_URL: mock.url, MUSE2API_KEY: "test-key", PI_MUSE_LOG: logFile,
-		PI_MUSE_BACKOFF: "0.05,0.05,0.05", PI_MUSE_POLL: "0.1", PI_MUSE_MAX_WAIT: "5", PI_MUSE_MAX_RETRIES: "3", PI_MUSE_AUTO_CONTINUE: "1", ...env,
+		PI_MUSE_BACKOFF: "0.05,0.05,0.05", PI_MUSE_POLL: "0.1", PI_MUSE_MAX_WAIT: "5", PI_MUSE_MAX_RETRIES: "3", PI_MUSE_AUTO_CONTINUE: "1", PI_MUSE_NON_IDEMPOTENT_WINDOW: "0", ...env,
 	});
 	const messages: any[] = [{ role: "system", content: "sys", toolsAdded: [bashTool] }];
 	process.chdir(dir);
@@ -136,7 +136,7 @@ test("autoContinue off -> stop and report", async () => {
 test("lock: manual 'continue' during auto-continue is rejected; exactly one in-flight request", async () => {
 	const mock = await startMock({ bg: "running-then-complete", runningMs: 1500 });
 	const dir = mkdtempSync(join(tmpdir(), "pimuse-"));
-	Object.assign(process.env, { PI_MUSE_CONFIG: join(dir, "none.json"), MUSE2API_URL: mock.url, PI_MUSE_LOG: join(dir, "l.jsonl"), PI_MUSE_BACKOFF: "0.05", PI_MUSE_POLL: "0.1", PI_MUSE_MAX_WAIT: "5", PI_MUSE_AUTO_CONTINUE: "1" });
+	Object.assign(process.env, { PI_MUSE_CONFIG: join(dir, "none.json"), MUSE2API_URL: mock.url, PI_MUSE_LOG: join(dir, "l.jsonl"), PI_MUSE_NON_IDEMPOTENT_WINDOW: "0", PI_MUSE_BACKOFF: "0.05", PI_MUSE_POLL: "0.1", PI_MUSE_MAX_WAIT: "5", PI_MUSE_AUTO_CONTINUE: "1" });
 	process.chdir(dir);
 	const messages: any[] = [{ role: "system", content: "sys", toolsAdded: [bashTool] }];
 	const auto = piTurn(dir, messages, "append a line");
@@ -171,4 +171,115 @@ test("HTTP 504 on turn start without a known thread -> stop (cannot verify state
 	assert.equal(r.reason, "error");
 	assert.match(r.msg.errorMessage, /504/);
 	assert.equal(mock.st.turns.length, 1);
+});
+
+// ---------------------------------------------------------------- held page / attach (muse2api keeps the device online)
+const followUp = (sid: string, text: string) => [
+	{ role: "system", content: "sys", toolsAdded: [bashTool] },
+	{ role: "user", content: "earlier" },
+	{ role: "assistant", content: [{ type: "text", text: "ok" }], responseId: `muse:${sid}` },
+	{ role: "user", content: text },
+];
+
+test("held: after a timeout pi-muse re-attaches; Muse's device call in that window runs; nothing re-sent", async () => {
+	const { r, mock, lines, delta } = await scenario("held-attach", { bg: "held" });
+	assert.equal(r.reason, "stop");
+	assert.equal(r.msg.content.find((c: any) => c.type === "text").text, "FINISHED VIA ATTACH");
+	assert.equal(mock.st.turns.length, 1, "no continuation sent");
+	assert.equal(mock.st.attaches, 1);
+	assert.deepEqual(mock.st.attachToolDeviceOnline, [true]);
+	assert.deepEqual(lines, ["step", "attached"], "both device steps ran exactly once");
+	assert.equal(delta.attached, 1);
+});
+
+test("held past max wait: cancel via muse2api, then continue (guard window 0)", async () => {
+	const { r, mock, lines } = await scenario("held-maxwait-cancel", { bg: "held-forever" }, { PI_MUSE_MAX_WAIT: "0.4" });
+	assert.equal(mock.st.cancelCalls, 1);
+	assert.equal(mock.st.turns.length, 2, "one continuation after the cancel");
+	assert.match(mock.st.turns[1].prompt, /The last step already ran: bash \{"command":"echo attached >> log\.txt"\}/);
+	assert.equal(r.msg.content.find((c: any) => c.type === "text").text, "resumed ok");
+	assert.deepEqual(lines, ["step", "attached"]);
+});
+
+test("manual 'continue' while the held turn still runs -> attach, never a parallel request", async () => {
+	const { r, mock } = await scenario("manual-continue-attach", { bg: "held", runningMs: 300 }, { PI_MUSE_AUTO_CONTINUE: "off" });
+	assert.equal(r.reason, "error"); // auto-continue off: stop and report
+	const m2 = await startMock({ bg: "held" });
+	m2.st.host = { owner: CLIENT_ID, running: true };
+	process.env.MUSE2API_URL = m2.url;
+	const msgs: any[] = followUp(m2.SID, "continue");
+	const dir = process.cwd();
+	const res = await piTurnMsgs(dir, msgs);
+	assert.match(res.msg.content.find((c: any) => c.type === "text").text, /your message was not sent[\s\S]*FINISHED VIA ATTACH/);
+	assert.equal(m2.st.turns.length, 0, "the manual 'continue' was not sent while Muse was running");
+	assert.equal(m2.st.attaches, 1);
+	m2.close();
+	mock.close();
+});
+
+async function piTurnMsgs(dir: string, messages: any[], mod: any = { streamLocal }) {
+	for (let i = 0; i < 10; i++) {
+		const r = await drain(mod.streamLocal(model, { messages } as any));
+		messages.push(r.msg);
+		if (r.reason !== "toolUse") return r;
+		for (const c of r.msg.content.filter((x: any) => x.type === "toolCall")) {
+			const out = execSync(c.arguments.command, { cwd: dir, encoding: "utf8" });
+			messages.push({ role: "toolResult", toolCallId: c.id, toolName: c.name, content: [{ type: "text", text: out || "" }], isError: false });
+		}
+	}
+	throw new Error("too many rounds");
+}
+
+test("two Pi windows on one thread: the second is refused (preflight busy, and server 409), upstream never sees two requests", async () => {
+	const winB = await import("../src/index.ts?window=B");
+	assert.notEqual(winB.CLIENT_ID, CLIENT_ID);
+	const mock = await startMock({ bg: "held-forever" });
+	const dir = mkdtempSync(join(tmpdir(), "pimuse-"));
+	Object.assign(process.env, { PI_MUSE_CONFIG: join(dir, "none.json"), MUSE2API_URL: mock.url, PI_MUSE_LOG: join(dir, "l.jsonl"), PI_MUSE_BACKOFF: "0.05", PI_MUSE_POLL: "0.1", PI_MUSE_MAX_WAIT: "3", PI_MUSE_AUTO_CONTINUE: "1", PI_MUSE_NON_IDEMPOTENT_WINDOW: "0" });
+	process.chdir(dir);
+	// window A: timed-out turn, re-attached, Muse still running (held-forever)
+	const msgsA: any[] = [{ role: "system", content: "sys", toolsAdded: [bashTool] }];
+	const a = piTurn(dir, msgsA, "append a line");
+	while (mock.st.attaches === 0) await new Promise((r) => setTimeout(r, 20));
+	// window B (another process' worth of module state) sends on the same thread
+	process.env.PI_MUSE_MAX_WAIT = "0.3";
+	const b = await drain(winB.streamLocal(model, { messages: followUp(mock.SID, "continue") } as any));
+	assert.equal(b.reason, "error");
+	assert.match(b.msg.errorMessage, /NOT sent: the Muse thread is busy with a turn started from another Pi window/);
+	// window B skipping the preflight race: server-side lock answers 409 -> clear message
+	const r409 = await fetch(`${mock.url}/pi/v1/turn`, { method: "POST", body: JSON.stringify({ prompt: "x", session_id: mock.SID, client_id: winB.CLIENT_ID }) });
+	assert.equal(r409.status, 409);
+	assert.equal(mock.st.turns.length, 1, "only window A's request ever reached upstream");
+	process.env.PI_MUSE_MAX_WAIT = "3";
+	mock.st.host!.cancelled = true;
+	mock.st.host!.wake?.();
+	await a.catch(() => {});
+	mock.close();
+});
+
+test("busy 409 from muse2api is reported clearly and not retried", async () => {
+	const mock = await startMock({ bg: "stopped" });
+	process.env.MUSE2API_URL = mock.url;
+	mock.st.inflightBySession.set(mock.SID, 1); // another client's request is in flight (state says idle: race)
+	const r = await drain(streamLocal(model, { messages: followUp(mock.SID, "hello") } as any));
+	assert.equal(r.reason, "error");
+	assert.match(r.msg.errorMessage, /is busy: another request .* Your message was NOT sent/);
+	assert.equal(mock.st.rejected409, 1);
+	mock.close();
+});
+
+// ---------------------------------------------------------------- non-idempotent guard
+test("guard: timeout right after a non-idempotent step (>>) -> stop and ask, no continuation", async () => {
+	const { r, mock, lines, delta } = await scenario("guard-stop", { bg: "stopped" }, { PI_MUSE_NON_IDEMPOTENT_WINDOW: "120" });
+	assert.equal(r.reason, "error");
+	assert.match(r.msg.errorMessage, /Not auto-continuing: the turn broke right after a non-idempotent step \(bash .*appends to a file/);
+	assert.equal(mock.st.turns.length, 1);
+	assert.deepEqual(lines, ["step"]);
+	assert.equal(delta.guarded, 1);
+});
+
+test("guard: idempotent step (read-only command) -> auto-continue proceeds", async () => {
+	const { r, mock } = await scenario("guard-idempotent-continue", { bg: "stopped", command: "cat /etc/hostname > /dev/null; echo ok" }, { PI_MUSE_NON_IDEMPOTENT_WINDOW: "120" });
+	assert.equal(r.msg.content.find((c: any) => c.type === "text").text, "resumed ok");
+	assert.equal(mock.st.turns.length, 2);
 });
