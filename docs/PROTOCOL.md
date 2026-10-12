@@ -55,3 +55,37 @@ which Muse's workspace layout (`AGENTS.md`, `SOUL.md`, `TOOLS.md`, `MEMORY.md`, 
 
 ## Workspace
 The VM home is `/home/hatch`; the agent's working dir is `/home/hatch/workspace` (`fs` path `workspace/...`).
+
+## Device nodes (used by `local` mode)
+Decoded from the web bundles (`HatchNodeRegister`, route table) and confirmed live, Oct 2026.
+
+| Method | Route | Params |
+|---|---|---|
+| `node.register` | POST `/api/nodes/register` | `{node_id, display_name, platform, commands_v2:{<name>:{description, required:{<arg>:{type, description}}, optional:{…}, timeout_ms?}}}` → `{node_id, status:"registered"}`. Fails with *"noise connection has no active stream; subscribe (chat.subscribe) before node.register"* until the page has subscribed. Arg types `string`/`number`/`boolean` are kept; `array`/`object` are stored as `string`. |
+| `node.heartbeat` | POST `/api/nodes/heartbeat` | `{node_id}` |
+| `node.list` | POST `/api/nodes/list` | → `{nodes:[{node_id, display_name, platform, commands_v2, connection_state:"online"\|"offline", online, last_seen_at, pairing_status}]}` |
+| `node.unpair` | POST `/api/nodes/unpair` | `{node_id}` |
+| `nodes.invoke_result` | POST `/nodes/invoke-result` | `{request_id, node_id, result:{ok:true, payload_json:"<json>"}}` or `{…, result:{ok:false, error:{code, message}}}`. `result.payload` needs `result.transfer` and cannot be combined with `payload_json`. → `{resolved:true, submission_status:"completed"}` |
+
+A node is "online" only while the Noise connection that registered it is alive. Sending a chat message
+replaces that connection, so the node must be re-registered after the message is sent.
+
+Muse's agent sees nodes as **devices** through a `device` tool namespace (`tool_search.load_tool_namespace {paths:["device"]}`,
+then `device.list`, `device.describe`, `device.invoke`). An invocation reaches the node's connection as a
+**request frame** (not an event):
+```json
+{"type":"req","id":"<uuid>","method":"node.invoke.request",
+ "params":{"node_id":"pi-host","command":"edit","params":{"path":"a.py","edits":"[…]"},
+           "request_id":"<uuid>","idempotency_key":null,"timeout_ms":30000}}
+```
+Unanswered invocations time out after ~30 s (`node_invoke_timeout`). The result text is shown to the
+model wrapped as external content (`source=device-data tool_name=device.invoke`).
+
+Related but unused: `client.register_capabilities` (`{client_id, platform, display_name, version,
+capabilities:{data_sources, device_commands, hatch_app_commands, rendering}}`) and `client.invoke` events
+answered with `client.invoke.result {invoke_id, ok, payload_json | error}`; the web app uses these for UI
+commands (`ui.navigate.*`, `pin.reminder`, voice).
+
+## File writes (used by `sync` mode)
+- `fs.write` `{path, text | data_base64, overwrite, append, create_parent}` → `{path, bytes_written, append}`; the web app uploads in 512 KiB chunks with `append:true` after the first.
+- `fs.delete` `{path, recursive}`, `fs.mkdir` `{path, recursive}`, `fs.rename` `{source, destination, create_parent}`.

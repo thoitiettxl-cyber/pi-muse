@@ -43,7 +43,7 @@ TAP_JS = r"""(function(){
   TextDecoder.prototype.decode = function(){
     var r = d.apply(this, arguments);
     try {
-      if (r && r.length > 20 && r.charCodeAt(0) === 123 && r.indexOf('"type":"event"') !== -1) {
+      if (r && r.length > 20 && ((r.charCodeAt(0) === 123 && r.indexOf('"type":"event"') !== -1) || r.indexOf('invoke') !== -1)) {
         window.__piTap.push(r);
         if (window.__piTap.length > 3000) window.__piTap.splice(0, 1000);
       }
@@ -125,6 +125,16 @@ def register(app, g):
     GEN_LOCK = g["GEN_LOCK"]; auth = g["auth"]; CFG = g["CFG"]; log = g["log"]
     renew = g["_renew_and_persist"]; sync_cookies = g["_sync_cookies"]
     model_cache: dict = {}
+    TURNS: dict = {}   # turn_id -> queue of node invoke results posted by the Pi client
+
+    @app.post("/pi/v1/invoke_result")
+    def pi_invoke_result(body: dict = Body(...), _=Depends(auth)):
+        tq = TURNS.get(body.get("turn_id") or "")
+        if tq is None:
+            raise HTTPException(404, "unknown or finished turn")
+        tq.put(body)
+        return {"ok": True}
+
 
     def with_page(fn, timeout=120):
         """Run fn(page) in a worker thread that owns a fresh muse.ai page."""
@@ -149,6 +159,34 @@ def register(app, g):
         if "e" in out:
             raise HTTPException(502, f"{type(out['e']).__name__}: {out['e']}")
         return out.get("r")
+
+    @app.post("/pi/v1/rpc")
+    def pi_rpc(body: dict = Body(...), _=Depends(auth)):
+        """Debug (PI_NATIVE_DEBUG_RPC=1): run raw gateway RPCs in one page session and return results + tapped events."""
+        import os
+        if os.environ.get("PI_NATIVE_DEBUG_RPC") != "1":
+            raise HTTPException(404, "debug rpc disabled (set PI_NATIVE_DEBUG_RPC=1)")
+        calls = body.get("calls") or []
+        listen = float(body.get("listen") or 0)
+        def fn(p):
+            p.js(TAP_JS); out = []
+            for c in calls:
+                if c.get("sleep"):
+                    time.sleep(float(c["sleep"])); continue
+                if c.get("js"):
+                    out.append({"js": p.js(c["js"], await_promise=True, timeout=60)}); continue
+                try:
+                    out.append({"ok": True, "r": gw_call(p, c["method"], c.get("params") or {})})
+                except Exception as e:  # noqa: BLE001
+                    out.append({"ok": False, "e": str(e)})
+            time.sleep(listen)
+            evs = []
+            for fr in json.loads(p.js(DRAIN_JS) or "[]"):
+                for line in fr.splitlines():
+                    try: evs.append(json.loads(line))
+                    except Exception: pass
+            return {"results": out, "events": evs}
+        return with_page(fn, timeout=int(listen) + 120)
 
     @app.get("/pi/v1/models")
     def pi_models(refresh: bool = False, _=Depends(auth)):
@@ -199,6 +237,50 @@ def register(app, g):
             return {"files": res}
         return with_page(fn)
 
+    @app.post("/pi/v1/fs/write")
+    def pi_fs_write(body: dict = Body(...), _=Depends(auth)):
+        """Batch gateway `fs.write`: {files:[{path, text | data_base64}]} (paths relative to /home/hatch)."""
+        files = body.get("files") or []
+        def fn(p):
+            res = []
+            for f in files:
+                path = (f.get("path") or "").lstrip("/")
+                if not path or ".." in path.split("/"):
+                    res.append({"path": path, "error": "bad path"}); continue
+                prm = {"path": path, "overwrite": True, "append": False, "create_parent": True}
+                if f.get("data_base64") is not None:
+                    prm["data_base64"] = f["data_base64"]
+                else:
+                    prm["text"] = f.get("text") or ""
+                try:
+                    r = gw_call(p, "fs.write", prm)
+                    res.append({"path": path, "bytes": (r or {}).get("bytes_written")})
+                except Exception as e:  # noqa: BLE001
+                    res.append({"path": path, "error": str(e)})
+            return {"files": res}
+        return with_page(fn, timeout=300)
+
+    @app.post("/pi/v1/fs/delete")
+    def pi_fs_delete(body: dict = Body(...), _=Depends(auth)):
+        paths = body.get("paths") or ([body["path"]] if body.get("path") else [])
+        def fn(p):
+            res = []
+            for path in paths:
+                path = (path or "").lstrip("/")
+                if not path.startswith("workspace/") or ".." in path.split("/"):
+                    res.append({"path": path, "error": "only paths under workspace/ may be deleted"}); continue
+                try:
+                    gw_call(p, "fs.delete", {"path": path, "recursive": bool(body.get("recursive"))})
+                    res.append({"path": path, "deleted": True})
+                except Exception as e:  # noqa: BLE001
+                    res.append({"path": path, "error": str(e)})
+            return {"files": res}
+        return with_page(fn)
+
+    @app.post("/pi/v1/node/unpair")
+    def pi_node_unpair(body: dict = Body(...), _=Depends(auth)):
+        return with_page(lambda p: gw_call(p, "node.unpair", {"node_id": body.get("node_id")}))
+
     @app.post("/pi/v1/turn")
     def pi_turn(body: dict = Body(...), _=Depends(auth)):
         prompt = (body.get("prompt") or "").strip()
@@ -214,6 +296,8 @@ def register(app, g):
         q: queue.Queue = queue.Queue()
         stop = threading.Event()
         tid = "turn-" + uuid.uuid4().hex[:12]
+        results_q: queue.Queue = queue.Queue()
+        TURNS[tid] = results_q
 
         def worker():
             acc_id = acc["id"]; cookies = acc["cookies"]; exp = acc.get("cookies_exp")
@@ -234,6 +318,15 @@ def register(app, g):
                         engine._wait_ws_ready(page, timeout=15.0)
                     wait_gateway(page)
                     page.js(TAP_JS)
+                    node = body.get("node")
+                    if node:
+                        end_n = time.time() + 20; err = None
+                        while time.time() < end_n:
+                            try:
+                                gw_call(page, "node.register", node); err = None; break
+                            except Exception as e:  # noqa: BLE001
+                                err = e; time.sleep(0.5)
+                        q.put({"type": "node", "registered": err is None, "error": str(err) if err else None})
                     prev_model = None
                     if model:
                         try:
@@ -257,7 +350,23 @@ def register(app, g):
                                 try:
                                     ev = json.loads(line)
                                 except Exception:
+                                    if body.get("debug_events") and "invoke" in line:
+                                        q.put({"type": "raw_frame", "text": line[:4000]})
                                     continue
+                                if isinstance(ev, dict) and ev.get("method") == "node.invoke.request":
+                                    pr = ev.get("params") or {}
+                                    if node and pr.get("node_id") == node.get("node_id"):
+                                        q.put({"type": "invoke", "turn_id": tid, "request_id": pr.get("request_id") or ev.get("id"),
+                                               "command": pr.get("command"), "params": pr.get("params") or {},
+                                               "timeout_ms": pr.get("timeout_ms")})
+                                        state["last_ev"] = time.time()
+                                    continue
+                                if not isinstance(ev, dict) or ev.get("type") != "event":
+                                    if body.get("debug_events") and "invoke" in line:
+                                        q.put({"type": "raw_frame", "text": line[:4000]})
+                                    continue
+                                if body.get("debug_events"):
+                                    q.put({"type": "raw_event", "event": ev.get("event"), "payload": ev.get("payload")})
                                 for rec in normalize(ev):
                                     # navigation into an existing thread replays old activity: drop it
                                     ts = _ts(rec.get("created_at") or rec.get("timestamp"))
@@ -274,11 +383,41 @@ def register(app, g):
 
                     # text comes from the existing DOM streamer; events are drained in a side thread
                     alive = threading.Event(); alive.set()
+                    def send_result(res):
+                        ok = bool(res.get("ok", True))
+                        payload = res.get("payload")
+                        inner = {"ok": ok}
+                        if ok:
+                            inner["payload_json"] = json.dumps(payload, ensure_ascii=False)
+                        else:
+                            inner["error"] = {"code": res.get("code") or "tool_error", "message": str(res.get("error") or "failed")}
+                        params = {"request_id": res["request_id"], "node_id": node["node_id"], "result": inner}
+                        try:
+                            r = gw_call(page, "nodes.invoke_result", params, timeout=20)
+                            q.put({"type": "invoke_ack", "request_id": res["request_id"], "response": r})
+                        except Exception as e:  # noqa: BLE001
+                            q.put({"type": "warning", "message": f"nodes.invoke_result failed: {e}"})
+
                     def pump():
+                        last_reg = 0.0
                         while alive.is_set() and not stop.is_set():
+                            if node and time.time() - last_reg > 4:
+                                last_reg = time.time()
+                                try:
+                                    gw_call(page, "node.register", node, timeout=10)
+                                    gw_call(page, "node.heartbeat", {"node_id": node["node_id"]}, timeout=10)
+                                except Exception as e:  # noqa: BLE001
+                                    q.put({"type": "warning", "message": f"node re-register: {e}"})
+                            while True:
+                                try:
+                                    res = results_q.get_nowait()
+                                except queue.Empty:
+                                    break
+                                send_result(res)
                             drain(); time.sleep(0.3)
                     pt = threading.Thread(target=pump, daemon=True); pt.start()
                     text = []
+                    engine.first_token_timeout = float(body.get("first_token_timeout") or (240 if node else 40))
                     try:
                         for chunk in engine.chat_stream(cookies, prompt, exp, timeout,
                                                         account_id=acc_id, stop_event=stop):
@@ -339,6 +478,8 @@ def register(app, g):
                 q.put({"type": "error", "message": f"{type(e).__name__}: {e}"})
             finally:
                 POOL.release(acc_id)
+                engine.first_token_timeout = 40.0
+                TURNS.pop(tid, None)
                 engine.close_current_page()
                 q.put(None)
 

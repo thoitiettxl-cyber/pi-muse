@@ -1,11 +1,24 @@
 {
   "name": "pi-muse",
-  "version": "0.1.0",
-  "description": "Pi coding agent provider for the Muse agent (muse.ai): real Muse models, Muse's cloud-VM tool calls mirrored as Pi tool calls, workspace sync.",
+  "version": "0.2.0",
+  "description": "Pi coding agent provider for the Muse agent (muse.ai): Muse works on the repo open in Pi through Pi's own tools (device-node bridge), with XML-tool, snapshot-sync and VM-mirror modes.",
   "type": "module",
   "license": "MIT",
-  "keywords": ["pi-package", "pi", "pi-coding-agent", "muse", "muse.ai", "openclaw", "agent", "provider"],
-  "pi": { "extensions": ["./src/index.ts"] },
+  "keywords": [
+    "pi-package",
+    "pi",
+    "pi-coding-agent",
+    "muse",
+    "muse.ai",
+    "openclaw",
+    "agent",
+    "provider"
+  ],
+  "pi": {
+    "extensions": [
+      "./src/index.ts"
+    ]
+  },
   "peerDependencies": {
     "@earendil-works/pi-ai": "*",
     "@earendil-works/pi-coding-agent": "*",

@@ -14,3 +14,16 @@ index a1da7f6..b52db4a 100644
 +    _pi_native.register(app, globals())
 +except Exception as _exc:  # noqa: BLE001
 +    log.warning("pi_native endpoints not loaded: %s", _exc)
+diff --git a/engine.py b/engine.py
+index fe56b1a..e5c74fd 100644
+--- a/engine.py
++++ b/engine.py
+@@ -951,7 +951,7 @@ class MuseEngine:
+ 
+         t_sent = time.time()
+         deadline = t_sent + timeout
+-        first_token_deadline = min(deadline, t_sent + 40.0)
++        first_token_deadline = min(deadline, t_sent + float(getattr(self, 'first_token_timeout', 40.0)))
+         sent, last, stable = "", None, 0
+         got_first = False
+ 

@@ -1,22 +1,18 @@
 /**
- * pi-muse: a Pi provider that talks to the Muse agent (muse.ai) and mirrors the
- * tools Muse runs inside its own cloud workspace VM as real Pi tool calls.
+ * pi-muse: a Pi provider for the Muse agent (muse.ai).
  *
- * Muse is not a plain LLM: every turn is executed by Muse's own agent runtime
- * (OpenClaw-style workspace with AGENTS.md / SOUL.md / TOOLS.md) on a per-user VM.
- * The backend (muse2api, branch `pi-native`) streams one Muse turn as SSE:
- *   text / text_done   assistant reply (DOM stream)
- *   activity           goal-level progress ("Run shell command", finish status)
- *   tool               one tool call Muse made (title, subtitle, report, status)
- *   session            Muse thread/session id
- *   done | error
+ * Modes (PI_MUSE_MODE / muse.json "mode" / /muse-mode):
+ *   local  (default) Muse works on the repo open in Pi. The backend registers this machine as a Muse
+ *          device node whose commands are Pi's tools; each `node.invoke.request` is surfaced as a Pi
+ *          toolCall, Pi runs it locally, and the result is posted back into the same Muse turn.
+ *   xml    Pi's tool schema is injected into the prompt (oh-my-pi XML dialect); `<invoke>` blocks in
+ *          Muse's reply become Pi toolCalls; results go back as the next Muse turn.
+ *   sync   snapshot of the git repo is pushed to ~/workspace/pi-sync/<repo> in Muse's VM before the
+ *          turn; Muse's changes are diffed back afterwards (/muse-pull, /muse-apply).
+ *   mirror Muse works in its own cloud VM; every VM tool call is mirrored as a pass-through
+ *          `muse_tool` call (one Muse turn => two Pi model requests).
  *
- * Mapping into Pi (one Muse turn => two Pi model requests):
- *   request #1  thinking (live progress) + toolCall blocks for every Muse tool  -> stopReason "toolUse"
- *               Pi then "executes" the pass-through tool `muse_tool`, which just returns the
- *               result Muse already produced (no local side effects).
- *   request #2  the provider sees those tool results and returns Muse's final reply text.
- * If Muse used no tools, request #1 returns the text directly.
+ * Backend: muse2api branch `pi-native` (backend/pi_native.py), SSE /pi/v1/turn.
  */
 import {
 	type Api,
@@ -30,9 +26,12 @@ import {
 } from "@earendil-works/pi-ai";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
-import { homedir } from "node:os";
-import { dirname, join, resolve } from "node:path";
+import { execFileSync } from "node:child_process";
+import { createHash, randomUUID } from "node:crypto";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { homedir, hostname, tmpdir } from "node:os";
+import { basename, dirname, join, resolve } from "node:path";
+import { collectSchemaTypes, decodeValue, type InbandTool, parseInvokes, renderToolResponses, renderToolsPrompt } from "./xml-dialect.ts";
 
 // ---------------------------------------------------------------------------
 // Configuration: env vars win, then ~/.pi/agent/muse.json
@@ -41,6 +40,10 @@ interface MuseConfig {
 	baseUrl: string;
 	apiKey: string;
 	settleTimeout: number;
+	/** local (default): Muse works on Pi's cwd via the node bridge; xml: in-band XML tools; sync: snapshot push/pull; mirror: Muse's own VM. */
+	mode: string;
+	/** sync mode: apply Muse's changes automatically after each turn (otherwise preview + /muse-apply). */
+	syncAutoApply: boolean;
 }
 
 function loadConfig(): MuseConfig {
@@ -55,6 +58,8 @@ function loadConfig(): MuseConfig {
 		baseUrl: (process.env.MUSE2API_URL ?? file.baseUrl ?? "http://127.0.0.1:18610").replace(/\/+$/, ""),
 		apiKey: process.env.MUSE2API_KEY ?? file.apiKey ?? "",
 		settleTimeout: Number(process.env.PI_MUSE_SETTLE_TIMEOUT ?? file.settleTimeout ?? 45),
+		mode: process.env.PI_MUSE_MODE ?? file.mode ?? "local",
+		syncAutoApply: (process.env.PI_MUSE_SYNC_AUTO_APPLY ?? String(file.syncAutoApply ?? "")) === "1" || String(file.syncAutoApply) === "true",
 	};
 }
 
@@ -165,7 +170,7 @@ function textOf(content: unknown): string {
 // ---------------------------------------------------------------------------
 // Provider stream
 // ---------------------------------------------------------------------------
-function streamMuse(model: Model<Api>, context: TranscriptContext, options?: SimpleStreamOptions): AssistantMessageEventStream {
+function streamMirror(model: Model<Api>, context: TranscriptContext, options?: SimpleStreamOptions): AssistantMessageEventStream {
 	const stream = createAssistantMessageEventStream();
 	const cfg = loadConfig();
 
@@ -215,8 +220,9 @@ function streamMuse(model: Model<Api>, context: TranscriptContext, options?: Sim
 
 			// ---- a new user turn ------------------------------------------------------------
 			const lastUser = [...msgs].reverse().find((m) => m.role === "user");
-			const prompt = textOf(lastUser?.content).trim();
-			if (!prompt) throw new Error("empty prompt");
+			const userPrompt = textOf(lastUser?.content).trim();
+			if (!userPrompt) throw new Error("empty prompt");
+			const prompt = mirrorPrefix + userPrompt;
 			let sessionId: string | undefined;
 			if (!forceNewThread) {
 				for (let i = msgs.length - 1; i >= 0; i--) {
@@ -351,6 +357,595 @@ function streamMuse(model: Model<Api>, context: TranscriptContext, options?: Sim
 }
 
 // ---------------------------------------------------------------------------
+// Local-workspace modes: Muse works on the repo that is open in Pi
+// ---------------------------------------------------------------------------
+type Mode = "local" | "xml" | "sync" | "mirror";
+const MODES: Mode[] = ["local", "xml", "sync", "mirror"];
+let mirrorPrefix = "";
+let modeOverride: Mode | undefined;
+function currentMode(): Mode {
+	const m = (modeOverride ?? loadConfig().mode) as Mode;
+	return MODES.includes(m) ? m : "local";
+}
+
+/** Tools Pi currently offers (system messages carry toolsAdded / toolsRemoved). */
+function collectTools(context: TranscriptContext): InbandTool[] {
+	const map = new Map<string, InbandTool>();
+	for (const m of context.messages as any[]) {
+		if (m?.role !== "system") continue;
+		for (const t of m.toolsAdded ?? []) map.set(t.name, t);
+		for (const r of m.toolsRemoved ?? []) map.delete(r.name);
+	}
+	map.delete(TOOL);
+	return [...map.values()];
+}
+
+/** JSON-schema-typed params that Muse's node registry would flatten to strings. */
+function complexKeys(tool: InbandTool | undefined): Set<string> {
+	const out = new Set<string>();
+	for (const [k, s] of Object.entries((tool?.parameters?.properties ?? {}) as Record<string, unknown>)) {
+		const t = collectSchemaTypes(s);
+		if (t.has("array") || t.has("object")) out.add(k);
+	}
+	return out;
+}
+
+function decodeArgs(tool: InbandTool | undefined, args: Record<string, unknown>): Record<string, unknown> {
+	const out: Record<string, unknown> = { ...args };
+	const props = (tool?.parameters?.properties ?? {}) as Record<string, unknown>;
+	for (const k of complexKeys(tool)) if (typeof out[k] === "string") out[k] = decodeValue(out[k] as string);
+	for (const [k, s] of Object.entries(props)) {
+		const t = collectSchemaTypes(s);
+		if ((t.has("number") || t.has("integer")) && typeof out[k] === "string" && out[k] !== "") {
+			const n = Number(out[k]);
+			if (!Number.isNaN(n)) out[k] = n;
+		}
+		if (t.has("boolean") && typeof out[k] === "string") out[k] = out[k] === "true";
+	}
+	return out;
+}
+
+/** Pi tool definitions -> Muse node `commands_v2` (decoded from muse.ai's bundles, see docs/PROTOCOL.md). */
+function nodeCommands(tools: InbandTool[]) {
+	const cmds: Record<string, any> = {};
+	for (const t of tools) {
+		const props = (t.parameters?.properties ?? {}) as Record<string, any>;
+		const req = new Set<string>(t.parameters?.required ?? []);
+		const required: Record<string, any> = {};
+		const optional: Record<string, any> = {};
+		for (const [k, s] of Object.entries(props)) {
+			const types = collectSchemaTypes(s);
+			types.delete("null");
+			let type = types.size === 1 ? [...types][0] : "string";
+			let description = String(s?.description ?? "");
+			if (type === "array" || type === "object") {
+				description += ` (pass as a JSON-encoded ${type}; schema: ${JSON.stringify(s).slice(0, 500)})`;
+				type = "string";
+			} else if (type === "integer") type = "number";
+			(req.has(k) ? required : optional)[k] = { type, description };
+		}
+		cmds[t.name] = { description: String(t.description ?? "").slice(0, 1500), required, optional, timeout_ms: 120000 };
+	}
+	return cmds;
+}
+
+function nodeIdentity(cwd: string) {
+	const host = hostname().replace(/[^A-Za-z0-9-]/g, "-").slice(0, 40) || "local";
+	return { node_id: `pi-${host}`.toLowerCase(), display_name: `Pi · ${basename(cwd)} (${host})` };
+}
+
+function lastSessionId(msgs: any[]): string | undefined {
+	for (let i = msgs.length - 1; i >= 0; i--) {
+		const rid = msgs[i]?.role === "assistant" ? msgs[i].responseId : undefined;
+		if (typeof rid === "string" && rid.startsWith("muse:")) return rid.slice(5);
+	}
+	return undefined;
+}
+
+function newOutput(model: Model<Api>): AssistantMessage {
+	return {
+		role: "assistant",
+		content: [],
+		api: model.api,
+		provider: model.provider,
+		model: model.id,
+		usage: {
+			input: 0,
+			output: 0,
+			cacheRead: 0,
+			cacheWrite: 0,
+			totalTokens: 0,
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+		},
+		stopReason: "pending" as any,
+		timestamp: Date.now(),
+	};
+}
+
+/** Small helper that owns one AssistantMessage stream. */
+function emitter(stream: AssistantMessageEventStream, output: AssistantMessage) {
+	let thinkIdx = -1;
+	return {
+		start() {
+			stream.push({ type: "start", partial: output });
+		},
+		think(line: string) {
+			if (thinkIdx < 0) {
+				output.content.push({ type: "thinking", thinking: "" } as any);
+				thinkIdx = output.content.length - 1;
+				stream.push({ type: "thinking_start", contentIndex: thinkIdx, partial: output });
+			}
+			(output.content[thinkIdx] as any).thinking += line;
+			stream.push({ type: "thinking_delta", contentIndex: thinkIdx, delta: line, partial: output });
+		},
+		endThinking() {
+			if (thinkIdx >= 0) {
+				const th = output.content[thinkIdx] as any;
+				stream.push({ type: "thinking_end", contentIndex: thinkIdx, content: th.thinking, partial: output });
+				thinkIdx = -2; // closed; never reopen in this message
+			}
+		},
+		text(text: string) {
+			this.endThinking();
+			output.content.push({ type: "text", text: "" });
+			const idx = output.content.length - 1;
+			stream.push({ type: "text_start", contentIndex: idx, partial: output });
+			(output.content[idx] as any).text = text;
+			stream.push({ type: "text_delta", contentIndex: idx, delta: text, partial: output });
+			stream.push({ type: "text_end", contentIndex: idx, content: text, partial: output });
+		},
+		toolCall(id: string, name: string, args: Record<string, unknown>) {
+			this.endThinking();
+			const toolCall = { type: "toolCall" as const, id, name, arguments: args };
+			output.content.push(toolCall as any);
+			const idx = output.content.length - 1;
+			stream.push({ type: "toolcall_start", contentIndex: idx, partial: output });
+			stream.push({ type: "toolcall_delta", contentIndex: idx, delta: JSON.stringify(args), partial: output });
+			stream.push({ type: "toolcall_end", contentIndex: idx, toolCall: toolCall as any, partial: output });
+		},
+		finish(reason: "stop" | "toolUse") {
+			this.endThinking();
+			output.stopReason = reason;
+			stream.push({ type: "done", reason, message: output });
+			stream.end();
+		},
+		fail(error: unknown, aborted: boolean) {
+			output.stopReason = aborted ? "aborted" : "error";
+			output.errorMessage = error instanceof Error ? error.message : String(error);
+			stream.push({ type: "error", reason: output.stopReason as any, error: output });
+			stream.end();
+		},
+	};
+}
+
+function progressLine(event: string, data: any): string | undefined {
+	if (event === "tool") {
+		if (data.status === "RUNNING") return undefined;
+		return `· Muse ${clean(data.title)}${data.subtitle ? ` — ${clean(data.subtitle)}` : ""}\n`;
+	}
+	if (event === "activity" && data.finished) return `▸ ${clean(data.title)}: ${clean(data.finish?.status ?? "")}\n`;
+	if (event === "warning") return `⚠ ${data.message}\n`;
+	if (event === "node") return data.registered ? "⇄ local device registered with Muse\n" : `⚠ node.register failed: ${data.error}\n`;
+	return undefined;
+}
+
+// ---- approach A: Muse node bridge ------------------------------------------------------------
+interface LiveTurn {
+	it: AsyncGenerator<{ event: string; data: any }>;
+	ctl: AbortController;
+	turnId?: string;
+	reply: string;
+	session?: string;
+	pending: Map<string, string>; // Pi toolCallId -> Muse request_id
+	tools: InbandTool[];
+	seenTools: Set<string>;
+}
+let live: LiveTurn | undefined;
+
+function localPreamble(cwd: string, node: { node_id: string; display_name: string }, tools: InbandTool[]): string {
+	return (
+		`[Pi bridge] My local project "${basename(cwd)}" is open in Pi on the paired device "${node.display_name}" ` +
+		`(device_id ${node.node_id}, online now). For this request the project lives ONLY on that device: inspect and ` +
+		`change files exclusively by invoking that device's commands (${tools.map((t) => t.name).join(", ")}) ` +
+		`with paths relative to the project root. Do not use your own VM shell, files or workspace for project work, ` +
+		`and do not ask me to upload anything. Invoke one command at a time and wait for its result. ` +
+		`When finished, reply with a short summary of what you changed.]\n\n`
+	);
+}
+
+async function postResult(cfg: MuseConfig, turnId: string | undefined, requestId: string, ok: boolean, text: string) {
+	const body = ok
+		? { turn_id: turnId, request_id: requestId, ok: true, payload: { output: text } }
+		: { turn_id: turnId, request_id: requestId, ok: false, error: text.slice(0, 4000) };
+	const res = await fetch(`${cfg.baseUrl}/pi/v1/invoke_result`, {
+		method: "POST",
+		headers: { "content-type": "application/json", authorization: `Bearer ${cfg.apiKey}` },
+		body: JSON.stringify(body),
+	});
+	if (!res.ok) throw new Error(`invoke_result HTTP ${res.status}: ${(await res.text()).slice(0, 200)}`);
+}
+
+function streamLocal(model: Model<Api>, context: TranscriptContext, options?: SimpleStreamOptions): AssistantMessageEventStream {
+	const stream = createAssistantMessageEventStream();
+	const cfg = loadConfig();
+	const output = newOutput(model);
+	const e = emitter(stream, output);
+	(async () => {
+		try {
+			const msgs = context.messages as any[];
+			const last = msgs[msgs.length - 1];
+			const onAbort = () => live?.ctl.abort();
+			options?.signal?.addEventListener("abort", onAbort, { once: true });
+			if (last?.role === "toolResult" && live) {
+				// hand the results of Pi's local tool runs back to Muse
+				e.start();
+				const trailing: any[] = [];
+				for (let i = msgs.length - 1; i >= 0 && msgs[i].role === "toolResult"; i--) trailing.unshift(msgs[i]);
+				for (const r of trailing) {
+					const rid = live.pending.get(r.toolCallId);
+					if (!rid) continue;
+					live.pending.delete(r.toolCallId);
+					await postResult(cfg, live.turnId, rid, !r.isError, textOf(r.content) || "(no output)");
+				}
+			} else if (last?.role === "toolResult") {
+				// results for a turn this process no longer owns (e.g. resumed session)
+				e.start();
+				e.text("(The Muse turn that requested these tool results is no longer running.)");
+				e.finish("stop");
+				return;
+			} else {
+				live?.ctl.abort();
+				live = undefined;
+				const lastUser = [...msgs].reverse().find((m) => m.role === "user");
+				const userText = textOf(lastUser?.content).trim();
+				if (!userText) throw new Error("empty prompt");
+				const tools = collectTools(context);
+				const cwd = process.cwd();
+				const node = nodeIdentity(cwd);
+				const sessionId = forceNewThread ? undefined : lastSessionId(msgs);
+				forceNewThread = false;
+				let payload: any = {
+					prompt: localPreamble(cwd, node, tools) + userText,
+					model: model.id,
+					session_id: sessionId,
+					settle_timeout: Math.min(cfg.settleTimeout, 20),
+					node: { ...node, platform: process.platform, commands_v2: nodeCommands(tools) },
+				};
+				const replaced = await options?.onPayload?.(payload, model as any);
+				if (replaced !== undefined) payload = replaced;
+				const ctl = new AbortController();
+				const res = await fetch(`${cfg.baseUrl}/pi/v1/turn`, {
+					method: "POST",
+					headers: { "content-type": "application/json", authorization: `Bearer ${options?.apiKey || cfg.apiKey}` },
+					body: JSON.stringify(payload),
+					signal: ctl.signal,
+				});
+				if (!res.ok || !res.body) throw new Error(`muse2api HTTP ${res.status}: ${(await res.text()).slice(0, 300)}`);
+				live = { it: sse(res), ctl, reply: "", session: sessionId, pending: new Map(), tools, seenTools: new Set() };
+				e.start();
+				e.think(`Muse is working on ${basename(cwd)} through the local device bridge…\n`);
+			}
+
+			const turn = live!;
+			for (;;) {
+				const { value, done } = await turn.it.next();
+				if (done) break;
+				const { event, data } = value;
+				await options?.onProviderStreamEvent?.(data, model as any);
+				if (event === "start") turn.turnId = data.turn_id;
+				else if (event === "invoke") {
+					turn.turnId = data.turn_id ?? turn.turnId;
+					const tool = turn.tools.find((t) => t.name === data.command);
+					if (!tool) {
+						await postResult(cfg, turn.turnId, data.request_id, false, `unknown command ${data.command}`);
+						continue;
+					}
+					const id = `muse_${String(data.request_id).replace(/[^A-Za-z0-9]/g, "").slice(0, 32)}`;
+					turn.pending.set(id, data.request_id);
+					if (turn.session) output.responseId = `muse:${turn.session}`;
+					e.toolCall(id, data.command, decodeArgs(tool, data.params ?? {}));
+					options?.signal?.removeEventListener("abort", onAbort);
+					e.finish("toolUse");
+					return;
+				} else if (event === "text_done") turn.reply = data.text ?? turn.reply;
+				else if (event === "final_text") turn.reply = data.text || turn.reply;
+				else if (event === "session" && data.session_id) turn.session = turn.session ?? data.session_id;
+				else if (event === "done") turn.session = data.session_id ?? turn.session;
+				else if (event === "error") throw new Error(data.message ?? "muse2api error");
+				else {
+					const key = event === "tool" ? `${data.id}|${data.status}` : "";
+					if (key && turn.seenTools.has(key)) continue;
+					if (key) turn.seenTools.add(key);
+					const line = progressLine(event, data);
+					if (line) e.think(line);
+				}
+			}
+			live = undefined;
+			if (options?.signal?.aborted) throw new Error("Request was aborted");
+			if (turn.session) output.responseId = `muse:${turn.session}`;
+			e.text(turn.reply.trim() || "(Muse finished this turn.)");
+			e.finish("stop");
+		} catch (error) {
+			live?.ctl.abort();
+			live = undefined;
+			e.fail(error, !!options?.signal?.aborted);
+		}
+	})();
+	return stream;
+}
+
+// ---- approach B: XML tool protocol ---------------------------------------------------------
+async function runMuseTurn(
+	cfg: MuseConfig,
+	payload: any,
+	signal: AbortSignal | undefined,
+	onEvent: (event: string, data: any) => void,
+): Promise<{ reply: string; session?: string }> {
+	const res = await fetch(`${cfg.baseUrl}/pi/v1/turn`, {
+		method: "POST",
+		headers: { "content-type": "application/json", authorization: `Bearer ${cfg.apiKey}` },
+		body: JSON.stringify(payload),
+		signal,
+	});
+	if (!res.ok || !res.body) throw new Error(`muse2api HTTP ${res.status}: ${(await res.text()).slice(0, 300)}`);
+	let reply = "";
+	let session: string | undefined = payload.session_id;
+	for await (const { event, data } of sse(res)) {
+		if (event === "text_done") reply = data.text ?? reply;
+		else if (event === "final_text") reply = data.text || reply;
+		else if (event === "done") session = data.session_id ?? session;
+		else if (event === "error") throw new Error(data.message ?? "muse2api error");
+		else onEvent(event, data);
+	}
+	return { reply, session };
+}
+
+function xmlPreamble(cwd: string, tools: InbandTool[]): string {
+	return (
+		`[Pi bridge — read carefully] I am working in a local project "${basename(cwd)}" on my own machine. ` +
+		`You cannot see it with your VM tools: your VM shell, files and workspace are NOT this project, so do not use them ` +
+		`for project work. Instead act through the functions below; my machine runs them and returns the results in my next message.\n\n` +
+		renderToolsPrompt(tools) +
+		`\n\nPaths are relative to the project root. Call functions until the task is done, then answer without any <invoke>.\n\n---\nTask: `
+	);
+}
+
+function streamXml(model: Model<Api>, context: TranscriptContext, options?: SimpleStreamOptions): AssistantMessageEventStream {
+	const stream = createAssistantMessageEventStream();
+	const cfg = loadConfig();
+	const output = newOutput(model);
+	const e = emitter(stream, output);
+	(async () => {
+		try {
+			const msgs = context.messages as any[];
+			const last = msgs[msgs.length - 1];
+			const tools = collectTools(context);
+			let sessionId = lastSessionId(msgs);
+			let prompt: string;
+			if (last?.role === "toolResult") {
+				const trailing: any[] = [];
+				for (let i = msgs.length - 1; i >= 0 && msgs[i].role === "toolResult"; i--) trailing.unshift(msgs[i]);
+				prompt =
+					renderToolResponses(trailing.map((r) => ({ text: (r.isError ? "ERROR: " : "") + (textOf(r.content) || "(no output)") }))) +
+					`\n\n[Pi bridge] Those are the results of your calls, in order. Continue: emit further <invoke> calls if needed, otherwise give the final answer.`;
+			} else {
+				const lastUser = [...msgs].reverse().find((m) => m.role === "user");
+				const userText = textOf(lastUser?.content).trim();
+				if (!userText) throw new Error("empty prompt");
+				if (forceNewThread) sessionId = undefined;
+				forceNewThread = false;
+				prompt = xmlPreamble(process.cwd(), tools) + userText;
+			}
+			e.start();
+			e.think("Muse is thinking (XML tool protocol)…\n");
+			const seen = new Set<string>();
+			let payload: any = { prompt, model: model.id, session_id: sessionId, settle_timeout: Math.min(cfg.settleTimeout, 15) };
+			const replaced = await options?.onPayload?.(payload, model as any);
+			if (replaced !== undefined) payload = replaced;
+			const { reply, session } = await runMuseTurn(cfg, payload, options?.signal, (ev, data) => {
+				const key = ev === "tool" ? `${data.id}|${data.status}` : "";
+				if (key && seen.has(key)) return;
+				if (key) seen.add(key);
+				const line = progressLine(ev, data);
+				if (line) e.think(line);
+			});
+			if (session) output.responseId = `muse:${session}`;
+			const { calls, prose } = parseInvokes(reply, tools);
+			const known = calls.filter((c) => tools.some((t) => t.name === c.name));
+			if (known.length === 0) {
+				e.text(reply.trim() || "(Muse finished this turn.)");
+				e.finish("stop");
+				return;
+			}
+			if (prose) e.think(`${prose}\n`);
+			for (const c of known) e.toolCall(`xml_${randomUUID().replace(/-/g, "").slice(0, 24)}`, c.name, c.arguments);
+			e.finish("toolUse");
+		} catch (error) {
+			e.fail(error, !!options?.signal?.aborted);
+		}
+	})();
+	return stream;
+}
+
+// ---- approach C: snapshot sync (/muse-push, /muse-pull, mode "sync") -------------------------
+const SYNC_SKIP = /(^|\/)(\.git|node_modules|__pycache__|\.venv|venv|dist|build|\.pytest_cache)(\/|$)/;
+const syncRemote = (cwd: string) => `workspace/pi-sync/${basename(cwd).replace(/[^A-Za-z0-9._-]/g, "_")}`;
+const syncStatePath = (cwd: string) => {
+	const git = join(cwd, ".git");
+	return existsSync(git) ? join(git, "pi-muse-sync.json") : join(cwd, ".pi-muse-sync.json");
+};
+const sha = (b: Buffer) => createHash("sha256").update(b).digest("hex");
+
+function localFiles(cwd: string): string[] {
+	try {
+		const out = execFileSync("git", ["ls-files", "-co", "--exclude-standard", "-z"], { cwd, maxBuffer: 64 << 20 }).toString();
+		return out.split("\0").filter((p) => p && !SYNC_SKIP.test(p) && existsSync(join(cwd, p)));
+	} catch {
+		throw new Error("muse sync needs a git repository (files are taken from `git ls-files`)");
+	}
+}
+
+async function syncPush(cwd: string): Promise<string> {
+	const remote = syncRemote(cwd);
+	const files = localFiles(cwd).filter((p) => statSync(join(cwd, p)).size <= 2 * 1024 * 1024);
+	const base: Record<string, string> = {};
+	let n = 0;
+	// start from a clean copy so files left over from an earlier round are not mistaken for Muse's work
+	await backend("/pi/v1/fs/delete", { paths: [remote], recursive: true }).catch(() => undefined);
+	for (let i = 0; i < files.length; i += 25) {
+		const batch = files.slice(i, i + 25).map((p) => {
+			const buf = readFileSync(join(cwd, p));
+			base[p] = sha(buf);
+			return { path: `${remote}/${p}`, data_base64: buf.toString("base64") };
+		});
+		const r = await backend("/pi/v1/fs/write", { files: batch });
+		const bad = (r.files ?? []).filter((f: any) => f.error);
+		if (bad.length) throw new Error(`fs.write failed for ${bad[0].path}: ${bad[0].error}`);
+		n += batch.length;
+	}
+	writeFileSync(syncStatePath(cwd), JSON.stringify({ remote, pushedAt: Date.now(), base }, null, 1));
+	return `Pushed ${n} file(s) to muse:~/${remote}`;
+}
+
+interface SyncChange {
+	path: string;
+	kind: "added" | "modified" | "deleted";
+	data?: Buffer;
+}
+
+async function syncDiff(cwd: string): Promise<{ remote: string; changes: SyncChange[]; conflicts: string[] }> {
+	const statePath = syncStatePath(cwd);
+	if (!existsSync(statePath)) throw new Error("nothing pushed yet: run /muse-push first");
+	const state = JSON.parse(readFileSync(statePath, "utf8"));
+	const remote: string = state.remote;
+	const base: Record<string, string> = state.base ?? {};
+	const listing = await backend("/pi/v1/fs/list", { path: remote, recursive: true, max_entries: 5000 });
+	const remoteFiles = (listing.entries ?? [])
+		.filter((e: any) => e.type === "file")
+		.map((e: any) => String(e.path).replace(/^\/+/, "").slice(remote.length + 1))
+		.filter((p: string) => p && !SYNC_SKIP.test(p));
+	const changes: SyncChange[] = [];
+	const conflicts: string[] = [];
+	for (let i = 0; i < remoteFiles.length; i += 20) {
+		const r = await backend("/pi/v1/fs/read", { paths: remoteFiles.slice(i, i + 20).map((p: string) => `${remote}/${p}`) });
+		for (const f of r.files ?? []) {
+			if (f.error) continue;
+			const rel = String(f.path).slice(remote.length + 1);
+			const data = Buffer.from(f.data_base64, "base64");
+			const h = sha(data);
+			if (base[rel] === h) continue;
+			const dst = join(cwd, rel);
+			const localNow = existsSync(dst) ? sha(readFileSync(dst)) : undefined;
+			if (localNow === h) continue;
+			if (base[rel] && localNow && localNow !== base[rel]) conflicts.push(rel); // changed on both sides
+			changes.push({ path: rel, kind: base[rel] || localNow ? "modified" : "added", data });
+		}
+	}
+	const remoteSet = new Set(remoteFiles);
+	for (const p of Object.keys(base)) if (!remoteSet.has(p) && existsSync(join(cwd, p))) changes.push({ path: p, kind: "deleted" });
+	return { remote, changes, conflicts };
+}
+
+function previewDiff(cwd: string, changes: SyncChange[]): string {
+	const tmp = mkdtempSync(join(tmpdir(), "pi-muse-"));
+	const parts: string[] = [];
+	for (const c of changes) {
+		const a = join(cwd, c.path);
+		const b = join(tmp, c.path.replace(/\//g, "__"));
+		writeFileSync(b, c.data ?? "");
+		const left = existsSync(a) ? a : "/dev/null";
+		const right = c.kind === "deleted" ? "/dev/null" : b;
+		try {
+			execFileSync("git", ["diff", "--no-index", "--no-color", "--", left, right], { cwd });
+		} catch (e: any) {
+			parts.push(String(e.stdout ?? "").replaceAll(left, `a/${c.path}`).replaceAll(right, `b/${c.path}`));
+		}
+	}
+	rmSync(tmp, { recursive: true, force: true });
+	return parts.join("\n");
+}
+
+function applyChanges(cwd: string, changes: SyncChange[]): string {
+	const root = resolve(cwd);
+	for (const c of changes) {
+		const dst = resolve(root, c.path);
+		if (!dst.startsWith(root + "/")) continue; // path traversal guard
+		if (c.kind === "deleted") rmSync(dst, { force: true });
+		else {
+			mkdirSync(dirname(dst), { recursive: true });
+			writeFileSync(dst, c.data!);
+		}
+	}
+	const st = JSON.parse(readFileSync(syncStatePath(cwd), "utf8"));
+	for (const c of changes) {
+		if (c.kind === "deleted") delete st.base[c.path];
+		else st.base[c.path] = sha(c.data!);
+	}
+	writeFileSync(syncStatePath(cwd), JSON.stringify(st, null, 1));
+	return changes.map((c) => `${c.kind === "added" ? "A" : c.kind === "deleted" ? "D" : "M"} ${c.path}`).join("\n");
+}
+
+function streamSync(model: Model<Api>, context: TranscriptContext, options?: SimpleStreamOptions): AssistantMessageEventStream {
+	const stream = createAssistantMessageEventStream();
+	const cwd = process.cwd();
+	(async () => {
+		const msgs = context.messages as any[];
+		const isNewUserTurn = msgs[msgs.length - 1]?.role === "user";
+		try {
+			if (isNewUserTurn) {
+				await syncPush(cwd);
+				mirrorPrefix =
+					`[Pi sync] A snapshot of my local project "${basename(cwd)}" is in your workspace at ~/${syncRemote(cwd)} ` +
+					`(that is /home/hatch/${syncRemote(cwd)}). Work ONLY inside that folder, edit files in place there, and do not ` +
+					`create files elsewhere for this task. I will pull your changes back to my machine afterwards.]\n\n`;
+			}
+		} catch (e) {
+			const out = newOutput(model);
+			emitter(stream, out).fail(e, false);
+			return;
+		}
+		const inner = streamMirror(model, context, options);
+		mirrorPrefix = "";
+		for await (const ev of inner as any) {
+			if (ev.type === "done" && ev.reason === "stop") {
+				let note = "";
+				try {
+					const { changes, conflicts } = await syncDiff(cwd);
+					if (!changes.length) note = "\n\n[muse sync] No changes in the Muse workspace copy.";
+					else if (loadConfig().syncAutoApply && !conflicts.length)
+						note = `\n\n[muse sync] Applied to local files:\n${applyChanges(cwd, changes)}`;
+					else
+						note =
+							`\n\n[muse sync] ${changes.length} change(s) pending${conflicts.length ? ` (conflicts: ${conflicts.join(", ")})` : ""}. ` +
+							`Review with /muse-pull, apply with /muse-apply.\n` +
+							changes.map((c) => `${c.kind[0].toUpperCase()} ${c.path}`).join("\n");
+				} catch (e) {
+					note = `\n\n[muse sync] pull failed: ${e instanceof Error ? e.message : e}`;
+				}
+				const msg = ev.message as AssistantMessage;
+				msg.content.push({ type: "text", text: "" });
+				const idx = msg.content.length - 1;
+				stream.push({ type: "text_start", contentIndex: idx, partial: msg });
+				(msg.content[idx] as any).text = note;
+				stream.push({ type: "text_delta", contentIndex: idx, delta: note, partial: msg });
+				stream.push({ type: "text_end", contentIndex: idx, content: note, partial: msg });
+			}
+			stream.push(ev);
+		}
+		stream.end();
+	})();
+	return stream;
+}
+
+function streamMuse(model: Model<Api>, context: TranscriptContext, options?: SimpleStreamOptions): AssistantMessageEventStream {
+	const mode = currentMode();
+	if (mode === "sync") return streamSync(model, context, options);
+	if (mode === "local") return streamLocal(model, context, options);
+	if (mode === "xml") return streamXml(model, context, options);
+	return streamMirror(model, context, options);
+}
+
+// ---------------------------------------------------------------------------
 // Helpers for workspace commands
 // ---------------------------------------------------------------------------
 async function backend(path: string, body?: unknown): Promise<any> {
@@ -386,6 +981,12 @@ const toPiModel = (m: any) => ({
 	contextWindow: m.context_window_tokens ?? 350000,
 	maxTokens: 32000,
 });
+
+/** notify in the TUI; print in non-interactive runs (pi -p) where notifications are not shown */
+function say(ctx: any, msg: string, level: "info" | "error" = "info") {
+	if (ctx.hasUI) ctx.ui.notify(msg, level);
+	else process.stdout.write(`${msg}\n`);
+}
 
 // ---------------------------------------------------------------------------
 // Extension entry point
@@ -445,6 +1046,56 @@ export default async function (pi: ExtensionAPI) {
 			const body = first && first.type === "text" ? first.text : "";
 			if (!expanded) return new Text(theme.fg("dim", d?.subtitle ?? body.split("\n")[0] ?? ""), 0, 0);
 			return new Text(theme.fg("toolOutput", body), 0, 0);
+		},
+	});
+
+	pi.registerCommand("muse-mode", {
+		description: "Show or set how Muse reaches your files: /muse-mode [local|xml|sync|mirror]",
+		handler: async (args, ctx) => {
+			const m = (args || "").trim() as Mode;
+			if (m) {
+				if (!MODES.includes(m)) return say(ctx, `unknown mode ${m}; use one of ${MODES.join(", ")}`, "error");
+				modeOverride = m;
+				forceNewThread = true; // modes use different prompts; start a fresh Muse thread
+			}
+			say(ctx, `Muse mode: ${currentMode()} (local = Muse edits this repo through Pi's tools; xml = in-band XML tools; sync = snapshot push/pull; mirror = Muse's own VM)`, "info");
+		},
+	});
+
+	pi.registerCommand("muse-push", {
+		description: "Upload a snapshot of this git repo (tracked + untracked, not ignored) to ~/workspace/pi-sync/<repo> in Muse",
+		handler: async (_args, ctx) => say(ctx, await syncPush(ctx.cwd), "info"),
+	});
+
+	pi.registerCommand("muse-pull", {
+		description: "Preview what Muse changed in ~/workspace/pi-sync/<repo> since /muse-push (diff), and optionally apply it",
+		handler: async (args, ctx) => {
+			const { remote, changes, conflicts } = await syncDiff(ctx.cwd);
+			if (!changes.length) return say(ctx, `No changes in muse:~/${remote}`, "info");
+			const diff = previewDiff(ctx.cwd, changes);
+			const head = `${changes.length} change(s) from muse:~/${remote}${conflicts.length ? `\n⚠ also changed locally since push: ${conflicts.join(", ")}` : ""}`;
+			const yes = /(^|\s)(--yes|-y)(\s|$)/.test(args || "");
+			if (!yes && !(ctx.hasUI && (await ctx.ui.confirm("Apply Muse changes?", `${head}\n\n${diff.slice(0, 6000)}`)))) {
+				return say(ctx, `${head}\n\n${diff}\n\nNot applied. Run /muse-apply to apply.`, "info");
+			}
+			say(ctx, `Applied:\n${applyChanges(ctx.cwd, changes)}`, "info");
+		},
+	});
+
+	pi.registerCommand("muse-apply", {
+		description: "Apply Muse's changes from ~/workspace/pi-sync/<repo> to the local repo without asking",
+		handler: async (_args, ctx) => {
+			const { changes } = await syncDiff(ctx.cwd);
+			say(ctx, changes.length ? `Applied:\n${applyChanges(ctx.cwd, changes)}` : "Nothing to apply", "info");
+		},
+	});
+
+	pi.registerCommand("muse-unsync", {
+		description: "Delete this repo's snapshot folder from the Muse workspace",
+		handler: async (_args, ctx) => {
+			await backend("/pi/v1/fs/delete", { paths: [syncRemote(ctx.cwd)], recursive: true });
+			rmSync(syncStatePath(ctx.cwd), { force: true });
+			say(ctx, `Removed muse:~/${syncRemote(ctx.cwd)}`, "info");
 		},
 	});
 
