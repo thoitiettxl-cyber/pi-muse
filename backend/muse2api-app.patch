@@ -15,15 +15,94 @@ index a1da7f6..b52db4a 100644
 +except Exception as _exc:  # noqa: BLE001
 +    log.warning("pi_native endpoints not loaded: %s", _exc)
 diff --git a/engine.py b/engine.py
-index fe56b1a..e5c74fd 100644
+index fe56b1a..df59ec8 100644
 --- a/engine.py
 +++ b/engine.py
-@@ -951,7 +951,7 @@ class MuseEngine:
+@@ -40,6 +40,16 @@ class MuseGenerationError(RuntimeError):
+     pass
+ 
+ 
++class MuseTimeoutError(MuseGenerationError):
++    """A bounded wait on Muse expired. Carries which timeout fired and what had been received."""
++
++    def __init__(self, msg: str, code: str, phase: str, timeout_s: float, waited_s: float,
++                 bytes_received: int = 0):
++        super().__init__(msg)
++        self.code, self.phase, self.timeout_s = code, phase, timeout_s
++        self.waited_s, self.bytes_received = round(waited_s, 1), bytes_received
++
++
+ class MuseEngine:
+     def __init__(self, cfg):
+         self.cfg = cfg
+@@ -951,18 +961,33 @@ class MuseEngine:
  
          t_sent = time.time()
          deadline = t_sent + timeout
 -        first_token_deadline = min(deadline, t_sent + 40.0)
-+        first_token_deadline = min(deadline, t_sent + float(getattr(self, 'first_token_timeout', 40.0)))
++        # first_token_timeout: max silence before the first text byte. When activity_fn is given
++        # (pi-native: gateway events / device tool calls), it counts from the last sign of life, so a
++        # long multi-tool turn whose text only arrives at the end is not cut off.
++        # idle_timeout: max gap between text chunks / events once text has started.
++        ftt = float(getattr(self, 'first_token_timeout', 40.0))
++        idle = float(getattr(self, 'idle_timeout', 0) or 0) or None
++        activity_fn = getattr(self, 'activity_fn', None)
++        def alive_since(t0):
++            a = activity_fn() if activity_fn else 0
++            return max(t0, a or 0)
          sent, last, stable = "", None, 0
          got_first = False
  
+         # 1. 等待助手生成并开始吐字（高频 60ms 采样，捕获到首批增量文字瞬间 yield 出去）
+-        while time.time() < first_token_deadline:
++        while True:
++            now = time.time()
++            if now >= deadline:
++                raise MuseTimeoutError("等待助手回复超时", "turn_timeout", "first_byte", timeout, now - t_sent)
++            if now - alive_since(t_sent) >= ftt:
++                raise MuseTimeoutError("等待助手首字响应超时", "first_byte_timeout", "first_byte", ftt,
++                                       now - alive_since(t_sent))
+             if stop_event is not None and stop_event.is_set():
+                 return
+             time.sleep(0.06)
+             cnt, cur, has_stop = self._poll_chat()
+             if not cur or (cnt <= base_agent and cur == base_text):
+-                if time.time() - t_sent > 14.0:
++                if time.time() - t_sent > 14.0 and not activity_fn:
+                     try:
+                         tail = self.page.js("document.body.innerText.slice(-500)") or ""
+                     except Exception:
+@@ -979,11 +1004,12 @@ class MuseEngine:
+                 got_first = True
+                 break
+ 
+-        if not got_first:
+-            raise MuseGenerationError("等待助手首字响应超时")
+-
+         # 2. 持续捕获增量文本
++        t_chunk = time.time()
+         while time.time() < deadline:
++            if idle and time.time() - alive_since(t_chunk) >= idle:
++                raise MuseTimeoutError("等待助手回复超时", "idle_timeout", "streaming", idle,
++                                       time.time() - alive_since(t_chunk), len(sent.encode()))
+             if stop_event is not None and stop_event.is_set():
+                 return
+             time.sleep(0.06)
+@@ -995,6 +1021,7 @@ class MuseEngine:
+                 delta = cur[len(sent):] if cur.startswith(sent) else cur
+                 if delta:
+                     sent = cur
++                    t_chunk = time.time()
+                     yield delta
+                 last, stable = cur, 0
+             else:
+@@ -1006,7 +1033,8 @@ class MuseEngine:
+                 if has_stop and stable >= 80:
+                     return
+ 
+-        raise MuseGenerationError("等待助手回复超时")
++        raise MuseTimeoutError("等待助手回复超时", "turn_timeout", "streaming", timeout, time.time() - t_sent,
++                               len(sent.encode()))
+ 
+     def chat(self, cookies: dict, prompt: str, expires: dict | None = None,
+              timeout: int | None = None, account_id: str | None = None) -> str:

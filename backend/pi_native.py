@@ -55,6 +55,55 @@ TAP_JS = r"""(function(){
 
 DRAIN_JS = "(function(){var t=window.__piTap||[];window.__piTap=[];return JSON.stringify(t);})()"
 
+import os
+
+
+def _envf(name: str, default: float) -> float:
+    try:
+        return float(os.environ.get(name) or default)
+    except ValueError:
+        return default
+
+
+# Timeouts (seconds). Env wins; a /pi/v1/turn body may override per turn.
+#   connect:    page/gateway ready + node.register
+#   first_byte: max silence (no text AND no gateway event / device call) before Muse's first text
+#   idle:       max gap between text chunks / events once text has started
+#   turn:       hard cap for one turn
+#   heartbeat:  interval of SSE ": keep-alive" comments while nothing else is sent
+def timeouts(body: dict, node: bool) -> dict:
+    return {
+        "connect": float(body.get("connect_timeout") or _envf("PI_NATIVE_CONNECT_TIMEOUT", 20)),
+        "first_byte": float(body.get("first_token_timeout") or body.get("first_byte_timeout")
+                            or _envf("PI_NATIVE_FIRST_BYTE_TIMEOUT" if node else "PI_NATIVE_FIRST_BYTE_TIMEOUT_CHAT",
+                                     900 if node else 60)),
+        "idle": float(body.get("idle_timeout") or _envf("PI_NATIVE_IDLE_TIMEOUT", 300)),
+        "turn": float(body.get("timeout") or _envf("PI_NATIVE_TURN_TIMEOUT", 3600 if node else 600)),
+        "heartbeat": max(1.0, _envf("PI_NATIVE_HEARTBEAT", 10)),
+    }
+
+
+def summarize(v, n: int = 160) -> str:
+    t = v if isinstance(v, str) else json.dumps(v, ensure_ascii=False)
+    t = " ".join(t.split())
+    return t if len(t) <= n else t[:n] + "…"
+
+
+def session_status(page, sid: str) -> dict:
+    """Muse thread state via gateway `sessions.get {id}` -> status running|completed|interrupted|..."""
+    r = gw_call(page, "sessions.get", {"id": sid}, timeout=15) or {}
+    return {"status": r.get("status"), "updated_at_ms": r.get("updated_at_ms"), "snippet": r.get("snippet")}
+
+
+def reply_after_last_user(page, sid: str) -> str | None:
+    h = gw_call(page, "chat.history", {"session_id": sid}) or {}
+    allev = h.get("chat_events") or []
+    last_user = max((i for i, e in enumerate(allev) if e.get("event_name") == "message.user"), default=-1)
+    parts = [(e.get("payload") or {}).get("content") or e.get("display_text") or ""
+             for e in allev[last_user + 1:] if e.get("event_name") == "message.assistant"]
+    return "\n\n".join(p for p in parts if p) or None
+
+
 INTERESTING = ("activity.", "sessions.updated", "chat.", "message.", "fs.", "tool")
 
 
@@ -188,6 +237,39 @@ def register(app, g):
             return {"results": out, "events": evs}
         return with_page(fn, timeout=int(listen) + 120)
 
+    @app.post("/pi/v1/thread/state")
+    def pi_thread_state(body: dict = Body(...), _=Depends(auth)):
+        """{session_id} -> {status, reply?}. status comes from gateway sessions.get (running|completed|interrupted)."""
+        sid = body.get("session_id")
+        if not sid:
+            raise HTTPException(400, "session_id required")
+        def fn(p):
+            st = session_status(p, sid)
+            if st["status"] and st["status"] != "running" and body.get("with_reply", True):
+                try:
+                    st["reply"] = reply_after_last_user(p, sid)
+                except Exception as e:  # noqa: BLE001
+                    st["reply_error"] = str(e)
+            return st
+        r = with_page(fn, timeout=60)
+        log.info("pi_thread_state %s", json.dumps({"session_id": sid, "status": r.get("status")}))
+        return r
+
+    @app.post("/pi/v1/thread/cancel")
+    def pi_thread_cancel(body: dict = Body(...), _=Depends(auth)):
+        """{session_id} -> gateway chat.cancel {session_id} -> {cancelled, message_id, status}."""
+        sid = body.get("session_id")
+        if not sid:
+            raise HTTPException(400, "session_id required")
+        def fn(p):
+            r = gw_call(p, "chat.cancel", {"session_id": sid}, timeout=20) or {}
+            time.sleep(1.5)
+            return {"cancelled": bool(r.get("cancelled")), "message_id": r.get("message_id"),
+                    "status": session_status(p, sid)["status"]}
+        r = with_page(fn, timeout=60)
+        log.warning("pi_thread_cancel %s", json.dumps({"session_id": sid, **r}))
+        return r
+
     @app.get("/pi/v1/models")
     def pi_models(refresh: bool = False, _=Depends(auth)):
         if refresh or not model_cache or time.time() - model_cache.get("t", 0) > 3600:
@@ -288,7 +370,8 @@ def register(app, g):
             raise HTTPException(400, "prompt is empty")
         model = body.get("model")              # e.g. "auto/auto", "ipnext/avocado-5.16-v0"
         session_id = body.get("session_id")    # continue an existing Muse thread
-        timeout = int(body.get("timeout") or CFG.chat_timeout)
+        TO = timeouts(body, bool(body.get("node")))
+        timeout = int(TO["turn"])
         settle = float(body.get("settle_timeout") or 45)
         acc = store.pick_account(rotate=True, preferred_id=getattr(engine, "current_acc_id", None))
         if not acc:
@@ -304,7 +387,8 @@ def register(app, g):
             POOL.acquire(account_id=acc_id, timeout=timeout)
             seen_session = {"id": session_id}
             t_start = time.time()
-            state = {"goal_seen": False, "goal_done": False, "last_ev": time.time()}
+            state = {"goal_seen": False, "goal_done": False, "last_ev": time.time(), "events": 0,
+                     "bytes": 0, "last_invoke": None, "last_result": None, "phase": "connect"}
             try:
                 fresh = renew(acc_id, wake_vm=True)
                 if fresh:
@@ -315,12 +399,13 @@ def register(app, g):
                     if session_id:
                         page.send("Page.navigate", {"url": f"https://muse.ai/thread/{session_id}"})
                         time.sleep(1.0)
-                        engine._wait_ws_ready(page, timeout=15.0)
-                    wait_gateway(page)
+                        engine._wait_ws_ready(page, timeout=TO["connect"])
+                    if not wait_gateway(page, timeout=TO["connect"]):
+                        q.put({"type": "warning", "message": f"Muse gateway not ready after {TO['connect']:.0f}s (connect timeout); continuing"})
                     page.js(TAP_JS)
                     node = body.get("node")
                     if node:
-                        end_n = time.time() + 20; err = None
+                        end_n = time.time() + TO["connect"]; err = None
                         while time.time() < end_n:
                             try:
                                 gw_call(page, "node.register", node); err = None; break
@@ -359,7 +444,11 @@ def register(app, g):
                                         q.put({"type": "invoke", "turn_id": tid, "request_id": pr.get("request_id") or ev.get("id"),
                                                "command": pr.get("command"), "params": pr.get("params") or {},
                                                "timeout_ms": pr.get("timeout_ms")})
-                                        state["last_ev"] = time.time()
+                                        state["last_ev"] = time.time(); state["events"] += 1
+                                        state["last_invoke"] = {"request_id": pr.get("request_id") or ev.get("id"),
+                                                                "command": pr.get("command"),
+                                                                "args": summarize(pr.get("params") or {}),
+                                                                "at": time.strftime("%Y-%m-%dT%H:%M:%S%z")}
                                     continue
                                 if not isinstance(ev, dict) or ev.get("type") != "event":
                                     if body.get("debug_events") and "invoke" in line:
@@ -378,7 +467,7 @@ def register(app, g):
                                     if rec["type"] == "activity":
                                         state["goal_seen"] = True
                                         state["goal_done"] = rec["finished"]
-                                    state["last_ev"] = time.time()
+                                    state["last_ev"] = time.time(); state["events"] += 1
                                     q.put(rec)
 
                     # text comes from the existing DOM streamer; events are drained in a side thread
@@ -391,6 +480,9 @@ def register(app, g):
                             inner["payload_json"] = json.dumps(payload, ensure_ascii=False)
                         else:
                             inner["error"] = {"code": res.get("code") or "tool_error", "message": str(res.get("error") or "failed")}
+                        state["last_result"] = {"request_id": res.get("request_id"), "ok": ok,
+                                                "result": summarize(payload if ok else res.get("error"))}
+                        state["last_ev"] = time.time()
                         params = {"request_id": res["request_id"], "node_id": node["node_id"], "result": inner}
                         try:
                             r = gw_call(page, "nodes.invoke_result", params, timeout=20)
@@ -417,14 +509,19 @@ def register(app, g):
                             drain(); time.sleep(0.3)
                     pt = threading.Thread(target=pump, daemon=True); pt.start()
                     text = []
-                    engine.first_token_timeout = float(body.get("first_token_timeout") or (240 if node else 40))
+                    engine.first_token_timeout = TO["first_byte"]
+                    engine.idle_timeout = TO["idle"]
+                    engine.activity_fn = (lambda: state["last_ev"]) if node else None
+                    state["phase"] = "first_byte"
                     try:
                         for chunk in engine.chat_stream(cookies, prompt, exp, timeout,
                                                         account_id=acc_id, stop_event=stop):
+                            state["phase"] = "streaming"; state["bytes"] += len(chunk.encode())
                             text.append(chunk)
                             q.put({"type": "text", "delta": chunk})
                     finally:
                         alive.clear(); pt.join(2)
+                    state["phase"] = "settle"
                     q.put({"type": "text_done", "text": "".join(text)})
                     # Muse writes activity reports asynchronously after the reply; wait for them.
                     t_end = time.time() + settle
@@ -474,11 +571,34 @@ def register(app, g):
                     pass
                 q.put({"type": "done", "session_id": seen_session["id"], "turn_id": tid})
             except Exception as e:  # noqa: BLE001
+                now = time.time()
+                code = getattr(e, "code", None) or ("connect_timeout" if str(e).startswith("connect_timeout") else None)
+                rec = {"type": "error", "message": f"{type(e).__name__}: {e}", "code": code,
+                       "retryable": bool(code and code.endswith("_timeout")),
+                       "phase": getattr(e, "phase", None) or state["phase"],
+                       "timeout_s": getattr(e, "timeout_s", None), "waited_s": getattr(e, "waited_s", None),
+                       "elapsed_s": round(now - t_start, 1),
+                       "started_at": datetime.fromtimestamp(t_start).astimezone().isoformat(timespec="seconds"),
+                       "failed_at": datetime.fromtimestamp(now).astimezone().isoformat(timespec="seconds"),
+                       "bytes_received": state["bytes"], "events_received": state["events"],
+                       "session_id": seen_session["id"], "turn_id": tid,
+                       "last_invoke": state["last_invoke"], "last_result": state["last_result"],
+                       "muse_cancelled": False}
+                # the timeout only ends OUR wait; the Muse turn keeps running server-side (verified:
+                # sessions.get stays "running"). Report its state; the client decides wait/cancel.
+                if seen_session["id"]:
+                    try:
+                        rec["muse_status"] = session_status(engine.page, seen_session["id"])["status"]
+                    except Exception as e2:  # noqa: BLE001
+                        rec["muse_status"] = None; rec["muse_status_error"] = str(e2)
                 log.warning("pi turn failed: %s", e)
-                q.put({"type": "error", "message": f"{type(e).__name__}: {e}"})
+                log.warning("pi_turn_error %s", json.dumps(rec, ensure_ascii=False))
+                q.put(rec)
             finally:
                 POOL.release(acc_id)
                 engine.first_token_timeout = 40.0
+                engine.idle_timeout = 0
+                engine.activity_fn = None
                 TURNS.pop(tid, None)
                 engine.close_current_page()
                 q.put(None)
@@ -490,9 +610,9 @@ def register(app, g):
                 yield "event: start\ndata: " + json.dumps({"turn_id": tid}) + "\n\n"
                 while True:
                     try:
-                        rec = q.get(timeout=15)
+                        rec = q.get(timeout=TO["heartbeat"])
                     except queue.Empty:
-                        yield ": keepalive\n\n"; continue
+                        yield ": keep-alive\n\n"; continue
                     if rec is None:
                         break
                     yield f"event: {rec['type']}\ndata: {json.dumps(rec, ensure_ascii=False)}\n\n"

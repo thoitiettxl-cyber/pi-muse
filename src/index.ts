@@ -28,9 +28,10 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
 import { execFileSync } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { homedir, hostname, tmpdir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
+import { type AutoContinueConfig, classifyMuseError, continuationMessage, type LastStep, recoverTurn, summarize, ThreadLock } from "./autocontinue.ts";
 import { collectSchemaTypes, decodeValue, type InbandTool, parseInvokes, renderToolResponses, renderToolsPrompt } from "./xml-dialect.ts";
 
 // ---------------------------------------------------------------------------
@@ -44,6 +45,18 @@ interface MuseConfig {
 	mode: string;
 	/** sync mode: apply Muse's changes automatically after each turn (otherwise preview + /muse-apply). */
 	syncAutoApply: boolean;
+	/** local mode: resume interrupted turns (timeouts / 504 / disconnects only) in the same Muse thread. */
+	autoContinue: boolean;
+	maxRetries: number;
+	/** max seconds to wait for a still-running Muse turn before cancelling it */
+	maxWaitSeconds: number;
+	pollSeconds: number;
+	backoffSeconds: number[];
+	/** optional per-turn overrides sent to muse2api (seconds); unset = backend defaults */
+	firstByteTimeout?: number;
+	idleTimeout?: number;
+	/** JSON-lines log of turn errors and recovery decisions */
+	logFile: string;
 }
 
 function loadConfig(): MuseConfig {
@@ -59,8 +72,31 @@ function loadConfig(): MuseConfig {
 		apiKey: process.env.MUSE2API_KEY ?? file.apiKey ?? "",
 		settleTimeout: Number(process.env.PI_MUSE_SETTLE_TIMEOUT ?? file.settleTimeout ?? 45),
 		mode: process.env.PI_MUSE_MODE ?? file.mode ?? "local",
+		autoContinue: !/^(0|false|off|no)$/i.test(process.env.PI_MUSE_AUTO_CONTINUE ?? String(file.autoContinue ?? "true")),
+		maxRetries: Number(process.env.PI_MUSE_MAX_RETRIES ?? file.maxRetries ?? 3),
+		maxWaitSeconds: Number(process.env.PI_MUSE_MAX_WAIT ?? file.maxWaitSeconds ?? 600),
+		pollSeconds: Number(process.env.PI_MUSE_POLL ?? file.pollSeconds ?? 5),
+		backoffSeconds: (process.env.PI_MUSE_BACKOFF ? process.env.PI_MUSE_BACKOFF.split(",").map(Number) : file.backoffSeconds) ?? [2, 5, 10],
+		firstByteTimeout: num(process.env.PI_MUSE_FIRST_BYTE_TIMEOUT ?? file.firstByteTimeout),
+		idleTimeout: num(process.env.PI_MUSE_IDLE_TIMEOUT ?? file.idleTimeout),
+		logFile: process.env.PI_MUSE_LOG ?? file.logFile ?? join(homedir(), ".pi", "agent", "muse-turns.log"),
 		syncAutoApply: (process.env.PI_MUSE_SYNC_AUTO_APPLY ?? String(file.syncAutoApply ?? "")) === "1" || String(file.syncAutoApply) === "true",
 	};
+}
+
+function num(v: unknown): number | undefined {
+	const n = Number(v);
+	return v === undefined || v === null || v === "" || !Number.isFinite(n) || n <= 0 ? undefined : n;
+}
+
+/** Structured JSON-lines log (errors, recovery decisions). Never contains the API key. */
+export function logTurn(cfg: MuseConfig, event: string, data: Record<string, unknown>) {
+	try {
+		mkdirSync(dirname(cfg.logFile), { recursive: true });
+		appendFileSync(cfg.logFile, `${JSON.stringify({ ts: new Date().toISOString(), event, ...data })}\n`);
+	} catch {
+		/* logging must never break a turn */
+	}
 }
 
 const PROVIDER = "muse";
@@ -587,11 +623,12 @@ function emitter(stream: AssistantMessageEventStream, output: AssistantMessage) 
 const MUSE_ERRORS: [RegExp, string][] = [
 	[/首字响应超时/, "timed out waiting for Muse's first response token"],
 	[/Still sending|连接超时/, "Muse cloud VM connection timed out"],
+	[/等待助手回复超时/, "timed out waiting for Muse's reply"],
 ];
 function describeMuseError(error: unknown): Error {
 	let msg = error instanceof Error ? error.message : String(error);
 	for (const [re, en] of MUSE_ERRORS) if (re.test(msg)) msg = `${msg} (${en})`;
-	if (!/aborted/i.test(msg)) msg += ". The Muse turn was interrupted; send a follow-up such as \"continue\" to resume in the same Muse thread.";
+	if (!/aborted|Not auto-continuing|gave up/i.test(msg)) msg += ". The Muse turn was interrupted; send a follow-up such as \"continue\" to resume in the same Muse thread.";
 	return new Error(msg);
 }
 
@@ -617,8 +654,63 @@ interface LiveTurn {
 	tools: InbandTool[];
 	seenTools: Set<string>;
 	ctx?: string;
+	owner: string;
+	payload: any;
+	gotDone?: boolean;
+	recovering?: boolean;
+	retries: number;
+	lastStep?: LastStep;
+	startedAt: number;
 }
 let live: LiveTurn | undefined;
+/** at most one in-flight request per Muse thread */
+export const threadLock = new ThreadLock();
+/** test hook: counts of what the extension did */
+export const stats = { continuations: 0, presented: 0, stopped: 0, rejected: 0 };
+
+class LockRejected extends Error {}
+
+function lastTodo(msgs: any[]): string | undefined {
+	for (let i = msgs.length - 1; i >= 0; i--) {
+		const m = msgs[i];
+		if (m?.role !== "assistant" || !Array.isArray(m.content)) continue;
+		for (const c of [...m.content].reverse()) if (c?.type === "toolCall" && /todo/i.test(c.name ?? "")) return summarize(c.arguments, 400);
+	}
+	return undefined;
+}
+
+function turnBody(base: any, cfg: MuseConfig) {
+	const b = { ...base };
+	if (cfg.firstByteTimeout) b.first_byte_timeout = cfg.firstByteTimeout;
+	if (cfg.idleTimeout) b.idle_timeout = cfg.idleTimeout;
+	return b;
+}
+
+async function openTurn(cfg: MuseConfig, apiKey: string, body: any, ctl: AbortController) {
+	let res: Response;
+	try {
+		res = await fetch(`${cfg.baseUrl}/pi/v1/turn`, {
+			method: "POST",
+			headers: { "content-type": "application/json", authorization: `Bearer ${apiKey}` },
+			body: JSON.stringify(body),
+			signal: ctl.signal,
+		});
+	} catch (e) {
+		throw Object.assign(new Error(`muse2api request failed: ${(e as any)?.cause?.code ?? ""} ${(e as any)?.message ?? e}`.trim()), { name: (e as any)?.name });
+	}
+	if (!res.ok || !res.body) throw Object.assign(new Error(`muse2api HTTP ${res.status}: ${(await res.text()).slice(0, 300)}`), { httpStatus: res.status });
+	return sse(res);
+}
+
+async function backendWith(cfg: MuseConfig, path: string, body: unknown): Promise<any> {
+	const res = await fetch(`${cfg.baseUrl}${path}`, {
+		method: "POST",
+		headers: { "content-type": "application/json", authorization: `Bearer ${cfg.apiKey}` },
+		body: JSON.stringify(body),
+	});
+	if (!res.ok) throw new Error(`${path} HTTP ${res.status}: ${(await res.text()).slice(0, 200)}`);
+	return res.json();
+}
 
 function localPreamble(cwd: string, node: { node_id: string; display_name: string }, tools: InbandTool[]): string {
 	return (
@@ -643,12 +735,13 @@ async function postResult(cfg: MuseConfig, turnId: string | undefined, requestId
 	if (!res.ok) throw new Error(`invoke_result HTTP ${res.status}: ${(await res.text()).slice(0, 200)}`);
 }
 
-function streamLocal(model: Model<Api>, context: TranscriptContext, options?: SimpleStreamOptions): AssistantMessageEventStream {
+export function streamLocal(model: Model<Api>, context: TranscriptContext, options?: SimpleStreamOptions): AssistantMessageEventStream {
 	const stream = createAssistantMessageEventStream();
 	const cfg = loadConfig();
 	const output = newOutput(model);
 	const e = emitter(stream, output);
 	(async () => {
+		let turn: LiveTurn | undefined;
 		try {
 			const msgs = context.messages as any[];
 			const last = msgs[msgs.length - 1];
@@ -663,7 +756,9 @@ function streamLocal(model: Model<Api>, context: TranscriptContext, options?: Si
 					const rid = live.pending.get(r.toolCallId);
 					if (!rid) continue;
 					live.pending.delete(r.toolCallId);
-					await postResult(cfg, live.turnId, rid, !r.isError, textOf(r.content) || "(no output)");
+					const text = textOf(r.content) || "(no output)";
+					if (live.lastStep) Object.assign(live.lastStep, { status: r.isError ? "error" : "ok", result: summarize(text, 300) });
+					await postResult(cfg, live.turnId, rid, !r.isError, text);
 				}
 			} else if (last?.role === "toolResult") {
 				// results for a turn this process no longer owns (e.g. resumed session)
@@ -672,7 +767,19 @@ function streamLocal(model: Model<Api>, context: TranscriptContext, options?: Si
 				e.finish("stop");
 				return;
 			} else {
-				live?.ctl.abort();
+				const ref = forceNewThread ? {} : lastMuseRef(msgs);
+				const sessionId = ref.session;
+				if (live?.recovering || (sessionId && threadLock.holder(sessionId) && threadLock.holder(sessionId) !== live?.owner)) {
+					stats.rejected++;
+					logTurn(cfg, "lock_rejected", { session: sessionId ?? live?.session });
+					throw new LockRejected(
+						`Muse is still recovering an interrupted turn in thread ${live?.session ?? sessionId}; your message was NOT sent (one request per Muse thread). Wait for it to finish, or press Esc to cancel it, then send again.`,
+					);
+				}
+				if (live) {
+					threadLock.release(live.session, live.owner);
+					live.ctl.abort();
+				}
 				live = undefined;
 				const lastUser = [...msgs].reverse().find((m) => m.role === "user");
 				const userText = textOf(lastUser?.content).trim();
@@ -680,84 +787,200 @@ function streamLocal(model: Model<Api>, context: TranscriptContext, options?: Si
 				const tools = collectTools(context);
 				const cwd = process.cwd();
 				const node = nodeIdentity(cwd);
-				const ref = forceNewThread ? {} : lastMuseRef(msgs);
-				const sessionId = ref.session;
 				forceNewThread = false;
 				const system = assembledSystemPrompt(msgs);
 				const hash = ctxHash(system);
 				const sendSystem = !sessionId || ref.ctx !== hash;
 				const ctxText = contextBlock(sendSystem ? system : "", sessionId ? "" : priorHistory(msgs));
-				let payload: any = {
-					prompt: localPreamble(cwd, node, tools) + ctxText + (ctxText ? "[Pi] Current request:\n" : "") + userText,
-					model: model.id,
-					session_id: sessionId,
-					settle_timeout: Math.min(cfg.settleTimeout, 20),
-					node: { ...node, platform: process.platform, commands_v2: nodeCommands(tools) },
-				};
+				let payload: any = turnBody(
+					{
+						prompt: localPreamble(cwd, node, tools) + ctxText + (ctxText ? "[Pi] Current request:\n" : "") + userText,
+						model: model.id,
+						session_id: sessionId,
+						settle_timeout: Math.min(cfg.settleTimeout, 20),
+						node: { ...node, platform: process.platform, commands_v2: nodeCommands(tools) },
+					},
+					cfg,
+				);
 				const replaced = await options?.onPayload?.(payload, model as any);
 				if (replaced !== undefined) payload = replaced;
 				if (process.env.PI_MUSE_DUMP) writeFileSync(process.env.PI_MUSE_DUMP, JSON.stringify({ payload, roles: msgs.map((m) => m.role) }, null, 1));
+				const owner = randomUUID();
+				if (sessionId) threadLock.tryAcquire(sessionId, owner);
 				const ctl = new AbortController();
-				const res = await fetch(`${cfg.baseUrl}/pi/v1/turn`, {
-					method: "POST",
-					headers: { "content-type": "application/json", authorization: `Bearer ${options?.apiKey || cfg.apiKey}` },
-					body: JSON.stringify(payload),
-					signal: ctl.signal,
-				});
-				if (!res.ok || !res.body) throw new Error(`muse2api HTTP ${res.status}: ${(await res.text()).slice(0, 300)}`);
-				live = { it: sse(res), ctl, reply: "", session: sessionId, pending: new Map(), tools, seenTools: new Set(), ctx: hash };
+				live = { it: undefined as any, ctl, reply: "", session: sessionId, pending: new Map(), tools, seenTools: new Set(), ctx: hash, owner, payload, retries: 0, startedAt: Date.now() };
+				turn = live;
+				live.it = await openTurn(cfg, options?.apiKey || cfg.apiKey, payload, ctl);
 				e.start();
 				e.think(`Muse is working on ${basename(cwd)} through the local device bridge…\n`);
 			}
 
-			const turn = live!;
+			turn = live!;
+			const t = turn;
+			const todo = lastTodo(msgs);
+			/** Returns a reply to present (Muse finished on its own) or undefined after resuming the stream; throws to stop. */
+			const recover = async (err: any): Promise<string | undefined> => {
+				const cls = classifyMuseError(err);
+				const info = {
+					session: t.session, turn_id: t.turnId, message: String(err?.message ?? err), code: err?.code ?? null, phase: err?.phase ?? null,
+					timeout_s: err?.timeout_s ?? null, waited_s: err?.waited_s ?? null, elapsed_s: err?.elapsed_s ?? Math.round((Date.now() - t.startedAt) / 100) / 10,
+					started_at: err?.started_at ?? new Date(t.startedAt).toISOString(), failed_at: err?.failed_at ?? new Date().toISOString(),
+					bytes_received: err?.bytes_received ?? null, events_received: err?.events_received ?? null, muse_status: err?.muse_status ?? null,
+					last_step: t.lastStep ?? null, backend_last_invoke: err?.last_invoke ?? null, classification: cls, retry: t.retries,
+				};
+				logTurn(cfg, "turn_error", info);
+				if (options?.signal?.aborted || !cls.retryable || !cfg.autoContinue) throw err;
+				if (t.retries >= cfg.maxRetries) {
+					stats.stopped++;
+					throw Object.assign(new Error(`${err?.message ?? err}. Auto-continue gave up after ${cfg.maxRetries} consecutive retries.`), { noHint: false });
+				}
+				t.recovering = true;
+				try {
+					const delay = (cfg.backoffSeconds[t.retries] ?? cfg.backoffSeconds[cfg.backoffSeconds.length - 1] ?? 10) * 1000;
+					t.retries++;
+					e.think(`⟳ Muse turn interrupted (${cls.reason}); checking thread state in ${delay / 1000}s (auto-continue ${t.retries}/${cfg.maxRetries})…\n`);
+					await sleep(delay, options?.signal);
+					const r = await recoverTurn(t.session, { autoContinue: true, maxRetries: cfg.maxRetries, backoffMs: [], maxWaitMs: cfg.maxWaitSeconds * 1000, pollMs: cfg.pollSeconds * 1000 }, {
+						getState: (sid) => backendWith(cfg, "/pi/v1/thread/state", { session_id: sid }),
+						cancel: (sid) => backendWith(cfg, "/pi/v1/thread/cancel", { session_id: sid }),
+						sleep: (ms) => sleep(ms, options?.signal),
+						log: (ev, d) => {
+							logTurn(cfg, ev, d);
+							if (ev === "thread_state" && d.status === "running") e.think("… Muse is still working on the interrupted turn; waiting for it\n");
+							if (ev === "thread_cancel") e.think("… Muse turn exceeded the max wait; cancelling it\n");
+						},
+						aborted: () => !!options?.signal?.aborted,
+					});
+					logTurn(cfg, "recovery", { session: t.session, ...r });
+					if (r.action === "stop") {
+						stats.stopped++;
+						throw Object.assign(new Error(`${err?.message ?? err}. Not auto-continuing: ${r.reason}.`), { noHint: false });
+					}
+					if (r.action === "present") {
+						stats.presented++;
+						e.think(`✓ Muse finished the interrupted turn on its own (after ${Math.round(r.waitedMs / 1000)}s); showing its result\n`);
+						return r.reply;
+					}
+					const msg = continuationMessage(t.lastStep, todo);
+					stats.continuations++;
+					logTurn(cfg, "continue", { session: t.session, cancelled: r.cancelled, status: r.status, message: msg });
+					e.think(`↻ resuming Muse thread ${t.session}${r.cancelled ? " (stale turn cancelled)" : ""}\n`);
+					t.ctl.abort();
+					t.ctl = new AbortController();
+					t.gotDone = false;
+					t.pending = new Map();
+					const body = { ...t.payload, prompt: msg, session_id: t.session };
+					t.payload = body;
+					t.startedAt = Date.now();
+					try {
+						t.it = await openTurn(cfg, options?.apiKey || cfg.apiKey, body, t.ctl);
+					} catch (e2) {
+						return await recover(e2); // a failed resume counts as the next consecutive retry
+					}
+					return undefined;
+				} finally {
+					t.recovering = false;
+				}
+			};
+
+			let presented: string | undefined;
 			for (;;) {
-				const { value, done } = await turn.it.next();
-				if (done) break;
-				const { event, data } = value;
+				let step: IteratorResult<{ event: string; data: any }>;
+				try {
+					step = await t.it.next();
+				} catch (err) {
+					presented = await recover(err);
+					if (presented !== undefined) break;
+					continue;
+				}
+				if (step.done) {
+					if (!t.gotDone) {
+						presented = await recover(new Error("muse2api stream ended without a done event (mid-stream disconnect)"));
+						if (presented !== undefined) break;
+						continue;
+					}
+					break;
+				}
+				const { event, data } = step.value;
 				await options?.onProviderStreamEvent?.(data, model as any);
-				if (event === "start") turn.turnId = data.turn_id;
+				if (event === "start") t.turnId = data.turn_id;
 				else if (event === "invoke") {
-					turn.turnId = data.turn_id ?? turn.turnId;
-					const tool = turn.tools.find((t) => t.name === data.command);
+					t.turnId = data.turn_id ?? t.turnId;
+					const tool = t.tools.find((x) => x.name === data.command);
 					if (!tool) {
-						await postResult(cfg, turn.turnId, data.request_id, false, `unknown command ${data.command}`);
+						await postResult(cfg, t.turnId, data.request_id, false, `unknown command ${data.command}`);
 						continue;
 					}
 					const id = `muse_${String(data.request_id).replace(/[^A-Za-z0-9]/g, "").slice(0, 32)}`;
-					turn.pending.set(id, data.request_id);
-					if (turn.session) output.responseId = `muse:${turn.session}#ctx=${turn.ctx}`;
-					e.toolCall(id, data.command, decodeArgs(tool, data.params ?? {}));
+					t.pending.set(id, data.request_id);
+					t.retries = 0;
+					const args = decodeArgs(tool, data.params ?? {});
+					t.lastStep = { tool: data.command, args, status: "pending" };
+					if (t.session) output.responseId = `muse:${t.session}#ctx=${t.ctx}`;
+					e.toolCall(id, data.command, args);
 					options?.signal?.removeEventListener("abort", onAbort);
 					e.finish("toolUse");
 					return;
-				} else if (event === "text_done") turn.reply = data.text ?? turn.reply;
-				else if (event === "final_text") turn.reply = data.text || turn.reply;
-				else if (event === "session" && data.session_id) turn.session = turn.session ?? data.session_id;
-				else if (event === "done") turn.session = data.session_id ?? turn.session;
-				else if (event === "error") throw new Error(data.message ?? "muse2api error");
-				else {
+				} else if (event === "text_done") {
+					t.reply = data.text ?? t.reply;
+					t.retries = 0;
+				} else if (event === "final_text") t.reply = data.text || t.reply;
+				else if (event === "session" && data.session_id) {
+					if (!t.session) {
+						t.session = data.session_id;
+						threadLock.tryAcquire(t.session!, t.owner);
+					}
+				} else if (event === "done") {
+					t.gotDone = true;
+					t.session = data.session_id ?? t.session;
+				} else if (event === "error") {
+					presented = await recover(Object.assign(new Error(data.message ?? "muse2api error"), data));
+					if (presented !== undefined) break;
+				} else {
 					const key = event === "tool" ? `${data.id}|${data.status}` : "";
-					if (key && turn.seenTools.has(key)) continue;
-					if (key) turn.seenTools.add(key);
+					if (key && t.seenTools.has(key)) continue;
+					if (key) t.seenTools.add(key);
 					const line = progressLine(event, data);
 					if (line) e.think(line);
 				}
 			}
+			if (presented !== undefined) t.reply = presented;
+			threadLock.release(t.session, t.owner);
+			t.ctl.abort();
 			live = undefined;
 			if (options?.signal?.aborted) throw new Error("Request was aborted");
-			if (turn.session) output.responseId = `muse:${turn.session}#ctx=${turn.ctx}`;
-			e.text(turn.reply.trim() || "(Muse finished this turn.)");
+			if (t.session) output.responseId = `muse:${t.session}#ctx=${t.ctx}`;
+			e.text(t.reply.trim() || "(Muse finished this turn.)");
 			e.finish("stop");
 		} catch (error) {
-			// keep the Muse thread reference so a follow-up prompt ("continue") resumes the same thread
-			if (live?.session) output.responseId = `muse:${live.session}#ctx=${live.ctx}`;
-			live?.ctl.abort();
-			live = undefined;
+			if (error instanceof LockRejected) {
+				e.fail(error, false);
+				return;
+			}
+			// keep the Muse thread reference so a manual follow-up resumes the same thread
+			const cur = turn ?? live;
+			if (cur?.session) output.responseId = `muse:${cur.session}#ctx=${cur.ctx}`;
+			if (cur) {
+				threadLock.release(cur.session, cur.owner);
+				cur.recovering = false;
+				cur.ctl.abort();
+			}
+			if (live === cur) live = undefined;
 			e.fail(describeMuseError(error), !!options?.signal?.aborted);
 		}
 	})();
 	return stream;
+}
+
+function sleep(ms: number, signal?: AbortSignal): Promise<void> {
+	return new Promise((res, rej) => {
+		if (signal?.aborted) return rej(new Error("Request was aborted"));
+		const t = setTimeout(res, ms);
+		signal?.addEventListener("abort", () => {
+			clearTimeout(t);
+			rej(new Error("Request was aborted"));
+		}, { once: true });
+	});
 }
 
 // ---- approach B: XML tool protocol ---------------------------------------------------------

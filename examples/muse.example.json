@@ -3,5 +3,14 @@
   "apiKey": "m2a_your_muse2api_key_here",
   "mode": "local",
   "syncAutoApply": false,
-  "settleTimeout": 45
+  "settleTimeout": 45,
+  "autoContinue": true,
+  "maxRetries": 3,
+  "backoffSeconds": [
+    2,
+    5,
+    10
+  ],
+  "maxWaitSeconds": 600,
+  "pollSeconds": 5
 }

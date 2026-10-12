@@ -23,7 +23,9 @@ Unofficial, reverse-engineered from the muse.ai web app (Oct 2026). Expect drift
 | `activity.get` / `activity.list` | GET `/activity/{id}`, `/activity` | activity feed incl. tool reports |
 | `fs.list` | POST `/fs/list` | `{path}` relative to `/home/hatch` (absolute paths rejected) |
 | `fs.read` | POST `/fs/read` | `{path, offset, len}` → `{len, eof, data_base64, text}` |
-| others seen | | `chat.stream`, `chat.subscribe`, `chat.cancel`, `session.start`, `sessions.list`, `fs.write/mkdir/delete/search/subscribe`, … |
+| `sessions.get` | GET `/sessions/{id}` | `{id}` → `{session_id, status, snippet, updated_at_ms, …}`; `status` is `running` while a turn is in flight, then `completed`, or `interrupted` after a cancel (verified Oct 2026) |
+| `chat.cancel` | POST `/chat/cancel` | `{session_id}` → `{cancelled, message_id}`; stops the running turn (`cancelled:false` if idle). The web app's Stop button uses it |
+| others seen | | `chat.stream`, `chat.subscribe`, `session.start`, `sessions.list`, `fs.write/mkdir/delete/search/subscribe`, … |
 
 Models observed: `auto/auto` ("Auto", 350k ctx) and `ipnext/avocado-5.16-v0` ("Avocado 5.16 v0", 350k ctx).
 
@@ -89,3 +91,11 @@ commands (`ui.navigate.*`, `pin.reminder`, voice).
 ## File writes (used by `sync` mode)
 - `fs.write` `{path, text | data_base64, overwrite, append, create_parent}` → `{path, bytes_written, append}`; the web app uploads in 512 KiB chunks with `append:true` after the first.
 - `fs.delete` `{path, recursive}`, `fs.mkdir` `{path, recursive}`, `fs.rename` `{source, destination, create_parent}`.
+
+## Timeouts vs. the running Muse turn
+
+muse2api's timeouts only bound how long muse2api waits; they do not stop the Muse turn. Evidence (Oct 2026):
+a turn sent with `first_token_timeout: 2` failed after ~5 s with
+`{"type":"error","message":"MuseGenerationError: 等待助手首字响应超时"}`, but `sessions.get` kept returning
+`status: "running"` and `chat.history` later contained Muse's reply (`DONE3`). `chat.cancel` on a running
+thread returned `{"cancelled": true}` and `sessions.get` then reported `status: "interrupted"`.

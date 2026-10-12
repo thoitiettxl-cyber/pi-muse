@@ -188,6 +188,45 @@ Non-interactive: `pi -p --model muse/auto/auto "…" < /dev/null` (or `--mode js
 | `PI_MUSE_OFFLINE=1` | | skip live model discovery at startup |
 | `PI_MUSE_MODELS_TIMEOUT_MS` | | `60000` |
 | `PI_MUSE_DUMP=/path.json` | | debug: write each `local`-mode turn payload sent to muse2api to this file |
+| `PI_MUSE_AUTO_CONTINUE` (`0`/`off` to disable) | `autoContinue` | `true`: resume interrupted `local` turns, see below |
+| `PI_MUSE_MAX_RETRIES` | `maxRetries` | `3` consecutive auto-continues per turn |
+| `PI_MUSE_BACKOFF` (e.g. `2,5,10`) | `backoffSeconds` | `[2, 5, 10]` |
+| `PI_MUSE_MAX_WAIT` | `maxWaitSeconds` | `600`: how long to wait for a Muse turn that is still running before cancelling it |
+| `PI_MUSE_POLL` | `pollSeconds` | `5`: thread-state poll interval while waiting |
+| `PI_MUSE_FIRST_BYTE_TIMEOUT` | `firstByteTimeout` | unset (backend default); per-turn override, mainly for tests |
+| `PI_MUSE_IDLE_TIMEOUT` | `idleTimeout` | unset (backend default) |
+| `PI_MUSE_LOG` | `logFile` | `~/.pi/agent/muse-turns.log`: JSON lines of turn errors and recovery decisions |
+
+## Interrupted turns and auto-continue (`local` mode)
+
+A long multi-tool turn can be cut off by a muse2api timeout or a dropped connection. pi-muse then recovers
+on its own, in the **same Muse thread**, without re-sending your prompt:
+
+1. **Classify.** Only transient failures are retried: muse2api timeouts (`code` ending in `_timeout`, or the
+   messages `等待助手首字响应超时` / `等待助手回复超时`), HTTP 504, and mid-stream disconnects (`terminated`,
+   `fetch failed`, `ECONNRESET`, stream ended without `done`). Auth (401/403, cookie/login), quota/rate-limit
+   (429, quota, credits), refusal/content-policy and user aborts stop immediately and are reported.
+2. **Check the Muse thread first.** A muse2api timeout only ends muse2api's wait; the Muse turn keeps running on
+   muse.ai (verified: `sessions.get` keeps reporting `running`). pi-muse polls `/pi/v1/thread/state` and
+   - if Muse is still running, **waits** (up to `maxWaitSeconds`);
+   - if Muse then finished on its own, shows **its result** and sends nothing;
+   - if it is still running after the max wait, cancels it (`chat.cancel`) and continues only once the thread
+     reports a non-running state;
+   - if the state cannot be determined (endpoint missing/failing, unknown status, no thread id yet), it
+     **stops and reports**; it never guesses.
+3. **Continue.** Otherwise it sends only a short continuation message, e.g.
+   `Continue from where you stopped. The last step already ran: bash {"command":"echo step >> log.txt"} -> (no output). Do not repeat it.`
+   (plus your todo list if the transcript has a todo tool call), so a non-idempotent step is not repeated.
+4. **Limits.** At most `maxRetries` consecutive attempts with `backoffSeconds` delays, then a clear error.
+   The counter resets when Muse makes progress (a device call or a reply).
+5. **One request per Muse thread.** While a turn is being recovered, a new prompt for the same thread
+   (e.g. a manual `continue`) is **rejected** with a message rather than queued: a queued `continue` would be
+   stale by the time the recovery finishes (it may already have presented Muse's result), so you decide again.
+   The lock is released in `finally` paths on success, error and crash.
+
+Every decision is logged as one JSON line in `logFile` (`turn_error` with code, message, phase, timeout,
+seconds waited, bytes/events received, thread id, last device step; `thread_state`, `thread_cancel`,
+`recovery`, `continue`, `lock_rejected`).
 
 ## Pi context forwarding (`local` mode)
 
@@ -209,6 +248,7 @@ the assistant message's `responseId` as `muse:<thread>#ctx=<hash>`), so follow-u
 
 - **`local` mode runs Muse's commands on your machine.** Every `bash` / `write` / `edit` Muse asks for is executed by Pi in your cwd with your user's rights, exactly like any other Pi model. Use it on repos you are happy to let an agent change, and keep them under git.
 - **Muse decides whether to use the device.** pi-muse prepends a short instruction ("the project lives only on device …; use its commands, not your VM") to each prompt. In tests Muse followed it every time, but it is a prompt, not a guarantee; Muse may also use its own memory/web tools, which show up in the thinking block.
+- **Auto-continue cannot keep the device online while Muse runs on.** After a muse2api timeout the page (and with it the device node) is closed, so if Muse is still running it cannot reach your machine until the continuation; its device calls in that window fail on Muse's side. The real fix is the backend's activity-aware first-byte timeout (default 900 s of *silence*, reset by every gateway event / device call), which makes these timeouts rare.
 - **The device exists only during a turn.** muse2api opens the muse.ai page per turn, so the node is online only while Pi is waiting on Muse. Between turns it shows as offline in Muse's device list. Muse's node-invoke timeout is about 30 s per call, so very long `bash` commands can time out on Muse's side even though they finish locally.
 - **One machine, one node.** The node id is `pi-<hostname>`; the display name carries the repo name. Two Pi sessions on one machine at the same time would share it (muse2api serializes turns anyway).
 - **`xml` mode is slow.** Every tool round-trip is a full Muse turn (~25–30 s), and long tool outputs are pasted into the chat.

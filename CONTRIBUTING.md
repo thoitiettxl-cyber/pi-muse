@@ -18,3 +18,11 @@ muse.ai is a moving target. If events change shape, update `backend/pi_native.py
 
 ## Style
 TypeScript, tabs, no build step (Pi loads TS via jiti). Python: keep `pi_native.py` dependency-free beyond what muse2api already uses.
+
+## Tests
+```bash
+ln -s ~/.pi/agent/install/releases/<pi-version>/node_modules node_modules   # Pi's own packages
+npm test   # unit tests (classifier, continuation message, lock, recovery) + mock-muse2api integration tests
+```
+The integration tests use a deterministic fake muse2api (`test/mock-muse2api.ts`); short timeouts and backoffs
+are set through env vars inside the tests only.
