@@ -94,3 +94,24 @@ Each `/pi/v1/turn` runs in a **ThreadHost** that owns one muse.ai page (and the 
 - `GET /pi/v1/hosts` lists the open hosts (debugging).
 
 Tests: `python -m unittest tests.test_pi_host` (fake Muse: device online flag, watcher, reaper, cancel, reuse).
+
+
+## Thread hosts: timing, accounts, limits (v0.6.0)
+
+All timing uses `time.monotonic()`; the hold cap restarts at every turn.
+
+| Env | Default | Meaning |
+|---|---|---|
+| `PI_NATIVE_HOLD_CAP` | turn timeout (600s local) | max time a single turn may hold its page; then `chat.cancel` + close |
+| `PI_NATIVE_REAPER_SLACK` | 60 | extra seconds past the cap before the reaper force-closes |
+| `PI_NATIVE_START_DEADLINE` | 45 | hosts stuck in STARTING/CHECKING are reaped after this |
+| `PI_NATIVE_STATUS_TIMEOUT` | 10 | timeout for each `sessions.get` call |
+| `PI_NATIVE_HOLD_GRACE` | 10 | idle page reuse window |
+| `PI_NATIVE_CANCEL_WAIT` | 30 | wait for `interrupted` after `chat.cancel` |
+
+- The account is picked and marked in `Registry.reserve()` in the same lock hold as the thread reservation (memory only). If none is free you get 503 `{error:"account_busy", held_by_thread, retry_after_s}` and `Retry-After`, before any page is opened. The account is released in the same lock hold that removes the host, and only by the host that owns it.
+- A reserve that finds the thread's previous host CLOSING waits (outside the lock) for it to be released and then opens a new host; no 409.
+- `sessions.get` / `chat.cancel` go through the page's gateway websocket, so the status check needs an open page; it cannot run before the page is opened.
+- `phase` is derived from `state`; RUNNING is entered only by compare-and-set from CHECKING/STARTING, so CLOSING is never overwritten.
+- `force_close()` always tries an idempotent page close, even if called twice, so a page created late can't leak.
+- Measured real turns (Oct 13 2026): 18–56s normally, one 226s tool-heavy turn; recommendation: keep the 600s default, lower it only for interactive use.

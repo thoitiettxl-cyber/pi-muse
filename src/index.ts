@@ -31,7 +31,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { appendFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { homedir, hostname, tmpdir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
-import { classifyMuseError, continuationMessage, type LastStep, nonIdempotentReason, type RecoverOpts, recoverTurn, summarize, ThreadLock } from "./autocontinue.ts";
+import { classifyMuseError, continuationMessage, isStrictReadOnly, type LastStep, nonIdempotentReason, type RecoverOpts, recoverTurn, summarize, ThreadLock } from "./autocontinue.ts";
 import { collectSchemaTypes, decodeValue, type InbandTool, parseInvokes, renderToolResponses, renderToolsPrompt } from "./xml-dialect.ts";
 
 // ---------------------------------------------------------------------------
@@ -59,6 +59,10 @@ interface MuseConfig {
 	logFile: string;
 	/** don't auto-continue if the turn broke within this many seconds after a non-idempotent device step */
 	nonIdempotentWindowSeconds: number;
+	/** strict: auto-continue only after allowlisted read-only steps; otherwise always ask */
+	strictAutoContinue: boolean;
+	/** bounded wait while the Muse account is busy with another thread (503 account_busy) */
+	accountBusyWaitSeconds: number;
 }
 
 function loadConfig(): MuseConfig {
@@ -81,6 +85,8 @@ function loadConfig(): MuseConfig {
 		backoffSeconds: (process.env.PI_MUSE_BACKOFF ? process.env.PI_MUSE_BACKOFF.split(",").map(Number) : file.backoffSeconds) ?? [2, 5, 10],
 		firstByteTimeout: num(process.env.PI_MUSE_FIRST_BYTE_TIMEOUT ?? file.firstByteTimeout),
 		idleTimeout: num(process.env.PI_MUSE_IDLE_TIMEOUT ?? file.idleTimeout),
+		strictAutoContinue: /^(1|true|on|yes)$/i.test(process.env.PI_MUSE_STRICT ?? String(file.strictAutoContinue ?? "false")),
+		accountBusyWaitSeconds: Number(process.env.PI_MUSE_ACCOUNT_BUSY_WAIT ?? file.accountBusyWaitSeconds ?? 60),
 		nonIdempotentWindowSeconds: Number(process.env.PI_MUSE_NON_IDEMPOTENT_WINDOW ?? file.nonIdempotentWindowSeconds ?? 120),
 		logFile: process.env.PI_MUSE_LOG ?? file.logFile ?? join(homedir(), ".pi", "agent", "muse-turns.log"),
 		syncAutoApply: (process.env.PI_MUSE_SYNC_AUTO_APPLY ?? String(file.syncAutoApply ?? "")) === "1" || String(file.syncAutoApply) === "true",
@@ -698,10 +704,11 @@ function turnBody(base: any, cfg: MuseConfig) {
 async function openTurn(cfg: MuseConfig, apiKey: string, body: any, ctl: AbortController, attempt = 0): Promise<AsyncGenerator<{ event: string; data: any }>> {
 	let res: Response;
 	try {
+		const { __accountWaited: _w, ...wire } = body;
 		res = await fetch(`${cfg.baseUrl}/pi/v1/turn`, {
 			method: "POST",
 			headers: { "content-type": "application/json", authorization: `Bearer ${apiKey}` },
-			body: JSON.stringify(body),
+			body: JSON.stringify(wire),
 			signal: ctl.signal,
 		});
 	} catch (e) {
@@ -721,6 +728,19 @@ async function openTurn(cfg: MuseConfig, apiKey: string, body: any, ctl: AbortCo
 	}
 	if (res.status === 503) {
 		const j: any = await res.json().catch(() => ({}));
+		if (j.error === "account_busy") {
+			const ra = Number(res.headers.get("retry-after") ?? j.retry_after_s ?? 5) || 5;
+			const waited = (body.__accountWaited ?? 0) as number;
+			if (waited + ra <= cfg.accountBusyWaitSeconds) {
+				// bounded wait: muse2api drives one page per Muse account; nothing was sent
+				await sleep(ra * 1000, ctl.signal);
+				return openTurn(cfg, apiKey, { ...body, __accountWaited: waited + ra }, ctl, attempt);
+			}
+			throw Object.assign(
+				new Error(`The Muse account is busy with another thread (${j.held_by_thread ?? "?"}, ${j.held_state ?? "running"}); waited ${waited}s (accountBusyWaitSeconds=${cfg.accountBusyWaitSeconds}). Your message was NOT sent; try again when that turn has finished.`),
+				{ httpStatus: 503, accountBusy: true },
+			);
+		}
 		throw Object.assign(new Error(`muse2api could not confirm the state of Muse thread ${body.session_id ?? ""} (${j.message ?? j.error ?? "state unknown"}). Your message was NOT sent.`), { httpStatus: 503 });
 	}
 	if (!res.ok || !res.body) throw Object.assign(new Error(`muse2api HTTP ${res.status}: ${(await res.text()).slice(0, 300)}`), { httpStatus: res.status });
@@ -956,6 +976,16 @@ export function streamLocal(model: Model<Api>, context: TranscriptContext, optio
 						return undefined;
 					}
 					const ls = t.lastStep;
+					if (cfg.strictAutoContinue && !(ls && ls.status !== "pending" && isStrictReadOnly(ls.tool, ls.args))) {
+						stats.guarded++;
+						logTurn(cfg, "strict_stop", { session: t.session, last_step: ls ?? null });
+						throw Object.assign(
+							new Error(
+								`${err?.message ?? err}. Not auto-continuing (strict mode): the last step ${ls ? `(${ls.tool} ${summarize(ls.args, 120)})` : "(none recorded)"} is not on the read-only allowlist. Check the state, then send "continue" to resume in the same Muse thread`,
+							),
+							{ noHint: true },
+						);
+					}
 					if (ls?.nonIdempotent && ls.finishedAt && Date.now() - ls.finishedAt < cfg.nonIdempotentWindowSeconds * 1000) {
 						stats.guarded++;
 						logTurn(cfg, "guard_stop", { session: t.session, last_step: ls });

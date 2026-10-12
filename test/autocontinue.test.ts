@@ -101,3 +101,14 @@ test("non-idempotent classification", () => {
 	];
 	for (const [t, a, ex] of no) assert.equal(nonIdempotentReason(t, a, ex), undefined, `${t} ${JSON.stringify(a)}`);
 });
+
+import { isStrictReadOnly } from "../src/autocontinue.ts";
+test("strict allowlist", () => {
+	for (const c of ["ls -la", "cat a.txt", "head -n 5 a", "tail f", "grep -r x .", "rg foo", "find . -name '*.ts'", "git status", "git diff HEAD", "git log -3", "pwd", "wc -l a", "ls | wc -l", "git status && git diff"])
+		assert.ok(isStrictReadOnly("bash", { command: c }), c);
+	for (const c of ["echo x", "cat a > b", "ls; rm x", "find . -delete", "find . -exec rm {} ;", "git push", "git show", "npm test", "cat $(x)", "curl https://x", "ls >> l", ""])
+		assert.ok(!isStrictReadOnly("bash", { command: c }), c);
+	assert.ok(isStrictReadOnly("read", { path: "a" }));
+	assert.ok(!isStrictReadOnly("write", { path: "a" }));
+	assert.ok(!isStrictReadOnly("edit", {}));
+});

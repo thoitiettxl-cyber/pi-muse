@@ -93,9 +93,10 @@ def summarize(v, n: int = 160) -> str:
     return t if len(t) <= n else t[:n] + "…"
 
 
-def session_status(page, sid: str) -> dict:
-    """Muse thread state via gateway `sessions.get {id}` -> status running|completed|interrupted|..."""
-    r = gw_call(page, "sessions.get", {"id": sid}, timeout=15) or {}
+def session_status(page, sid: str, timeout: float = 10) -> dict:
+    """Muse thread state via gateway `sessions.get {id}` -> status running|completed|interrupted|...
+    Needs the page: the gateway is reachable only through the page's Noise-encrypted websocket."""
+    r = gw_call(page, "sessions.get", {"id": sid}, timeout=timeout) or {}
     return {"status": r.get("status"), "updated_at_ms": r.get("updated_at_ms"), "snippet": r.get("snippet")}
 
 
@@ -395,9 +396,12 @@ def register(app, g):
         REG.close_all("muse2api shutdown")
 
     def host_cfg(TO):
-        return {"cap": TO["turn"], "watch": _envf("PI_NATIVE_WATCH_INTERVAL", 3),
+        # hold cap: max time one turn may keep the page/device/account (watcher cancels, reaper backs it up)
+        return {"cap": _envf("PI_NATIVE_HOLD_CAP", TO["turn"]), "watch": _envf("PI_NATIVE_WATCH_INTERVAL", 3),
                 "grace": _envf("PI_NATIVE_HOLD_GRACE", 10), "heartbeat": TO["heartbeat"],
-                "reaper_slack": _envf("PI_NATIVE_REAPER_SLACK", 60), "cancel_wait": 30}
+                "reaper_slack": _envf("PI_NATIVE_REAPER_SLACK", 60), "cancel_wait": _envf("PI_NATIVE_CANCEL_WAIT", 30),
+                "status_timeout": _envf("PI_NATIVE_STATUS_TIMEOUT", 10),
+                "start_deadline": _envf("PI_NATIVE_START_DEADLINE", 45)}
 
     class RealOps:
         """Page operations for a ThreadHost, backed by muse2api's engine (runs on the host thread)."""
@@ -572,7 +576,8 @@ def register(app, g):
                     pass
 
         def status(self, host, sid):
-            return session_status(self.page, sid)["status"]
+            # HTTP-level deadline on the gateway call itself; ThreadHost._status adds a thread deadline on top
+            return session_status(self.page, sid, timeout=host.cfg.get("status_timeout", 10))["status"]
 
         def cancel(self, host, sid):
             return gw_call(self.page, "chat.cancel", {"session_id": sid}, timeout=20)
@@ -615,6 +620,10 @@ def register(app, g):
             self.page = None
             if threading.current_thread() is host.thread:
                 try:
+                    engine._close_page()   # page created by ensure_page() but open() failed before we kept it
+                except Exception:
+                    pass
+                try:
                     engine.page = None; engine.current_context_id = None; engine.current_acc_id = None
                 except Exception:
                     pass
@@ -635,12 +644,19 @@ def register(app, g):
         client_id = body.get("client_id")
         TO = timeouts(body, bool(body.get("node")))
         tid = "turn-" + uuid.uuid4().hex[:12]
-        acc = store.pick_account(rotate=True, preferred_id=getattr(engine, "current_acc_id", None))
-        if not acc:
+        # candidate accounts: in-memory snapshot (no file I/O); the actual pick happens inside reserve()
+        pref = getattr(engine, "current_acc_id", None)
+        cands = [a for a in list(store.accounts) if a.get("enabled", True) and a.get("cookies")]
+        cands.sort(key=lambda a: a["id"] != pref)
+        if not cands:
             raise HTTPException(400, "no Muse account imported in muse2api")
         kind, h = start_or_busy(REG, session_id, client_id, prompt, tid,
-                                lambda: ThreadHost(REG, RealOps(body, TO, acc), client_id, host_cfg(TO), log, session_id=session_id),
-                                wait_s=TO["connect"] + 120)
+                                lambda acc: ThreadHost(REG, RealOps(body, TO, acc), client_id, host_cfg(TO), log, session_id=session_id),
+                                wait_s=TO["connect"] + 120, accounts=cands)
+        if kind == "account_busy":
+            log.warning("pi_host %s", json.dumps({"event": "account_busy_rejected", "session_id": session_id, **h}))
+            return JSONResponse(status_code=503, content={**h, "message": "the Muse account is busy with another thread; retry later"},
+                                headers={"Retry-After": str(h["retry_after_s"])})
         if kind == "unavailable":
             log.warning("pi_host %s", json.dumps({"event": "state_unknown_rejected", **h}))
             return JSONResponse(status_code=503, content=h)
@@ -668,4 +684,4 @@ def register(app, g):
 
     @app.get("/pi/v1/hosts")
     def pi_hosts(_=Depends(auth)):
-        return [{"session_id": h.session, **h.info(None), "age_s": round(time.time() - h.started, 1)} for h in REG.open_hosts()]
+        return [{"session_id": h.session, **h.info(None), "age_s": round(time.monotonic() - h.started, 1)} for h in REG.open_hosts()]

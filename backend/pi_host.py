@@ -30,6 +30,8 @@ import threading
 import time
 from datetime import datetime
 
+mono = time.monotonic      # all durations / deadlines; wall clock only for printed timestamps
+
 END = "_end"     # record flag: the SSE request ends after this record (the host may live on)
 NOT_RUNNING = ("completed", "interrupted", "cancelled", "canceled", "failed", "error", "idle")
 
@@ -73,8 +75,13 @@ class Registry:
             return [h for h in self.hosts if h.state != CLOSED]
 
     # ---- reservation: per-thread lock + reuse decision, all in one lock hold
-    def reserve(self, session_id, client_id, prompt, tid, make_host):
-        """-> ("reuse", host) | ("new", host) | ("busy", info). Never blocks, never does I/O."""
+    def reserve(self, session_id, client_id, prompt, tid, make_host, accounts=None):
+        """Reserve the thread AND an account in ONE lock hold, before any page is opened.
+
+        accounts: candidate account dicts in preference order (a memory snapshot taken by the caller;
+        picking among them here is pure in-memory work). make_host(account) builds the host.
+        -> ("reuse", host) | ("new", host) | ("busy", info) | ("account_busy", info) | ("closing", host)
+        Never blocks, never does I/O; a CLOSING host is returned so the caller can wait OUTSIDE the lock."""
         with self.lock:
             h = self.by_session.get(session_id) if session_id else None
             if h is not None:
@@ -82,12 +89,28 @@ class Registry:
                     h._accept_turn_locked(prompt, tid, client_id)
                     self.by_turn[tid] = h
                     return "reuse", h
-                return "busy", {"error": "thread_busy", "session_id": session_id, "phase": h.state, "turn_id": h.tid,
-                                "held": True, "retry_after": 1 if h.state in (CLOSING, BROKEN) else None,
+                if h.state in (CLOSING, CLOSED):
+                    return "closing", h
+                return "busy", {"error": "thread_busy", "session_id": session_id, "phase": h.phase, "turn_id": h.tid,
+                                "held": True, "retry_after": 1 if h.state == BROKEN else None,
                                 "muse_status": "running" if h.state in (RUNNING, WATCH) else h.last_status,
                                 "owner_is_you": bool(client_id and client_id == h.owner)}
-            h = make_host()                     # constructor touches no registry state
+            acc = None
+            if accounts is not None:
+                acc = next((a for a in accounts if a["id"] not in self.accounts), None)
+                if acc is None:
+                    # muse2api drives one page per account: every candidate is held by another thread
+                    other = self.accounts.get(accounts[0]["id"]) if accounts else None
+                    return "account_busy", {"error": "account_busy",
+                                            "account_id": accounts[0]["id"] if accounts else None,
+                                            "held_by_thread": other.session if other else None,
+                                            "held_state": other.state if other else None,
+                                            "retry_after_s": max(1, int(other.retry_after_s())) if other else 5}
+            h = make_host(acc)                  # constructor touches no registry state, no I/O
             h._new_turn_locked(tid)
+            if acc is not None:
+                self.accounts[acc["id"]] = h    # account marked busy in the same hold as the thread
+                h.account_id = acc["id"]
             self.hosts.add(h)
             self.by_turn[tid] = h
             if session_id:
@@ -102,26 +125,29 @@ class Registry:
             self.by_session[sid] = host
             return True
 
-    def mark_account(self, host, account_id: str):
-        with self.lock:
-            self.accounts[account_id] = host
-            host.account_id = account_id
 
     def release(self, host):
-        """Remove the host AND its account reservation in the same lock hold."""
+        """Remove the host AND its account reservation in the same lock hold.
+        Only entries that point at THIS host are removed (an account re-reserved by another host is untouched)."""
         with self.lock:
+            owned = host.account_id is not None and self.accounts.get(host.account_id) is host
             self.hosts.discard(host)
             for d in (self.by_session, self.by_turn, self.accounts):
                 for k in [k for k, v in d.items() if v is host]:
                     del d[k]
             host.state = CLOSED
+            return owned
 
     # ---- leak protection
     def reap_once(self, now: float | None = None):
-        now = now or time.time()
+        now = now or mono()
         for h in self.open_hosts():
-            if now > h.started + h.cfg["cap"] + h.cfg["reaper_slack"]:
-                h._log("host_reaped", age_s=round(now - h.started, 1))
+            if h.state in (STARTING, CHECKING) and now > h.started + h.cfg.get("start_deadline", 45):
+                h._log("host_reaped", reason="stuck opening/checking", age_s=round(now - h.started, 1), state=h.state)
+                h.force_close("reaped: start deadline exceeded")
+                continue
+            if now > h.turn_started + h.cfg["cap"] + h.cfg["reaper_slack"]:
+                h._log("host_reaped", turn_age_s=round(now - h.turn_started, 1))
                 h.force_close("reaped: hard cap exceeded")
 
     def ensure_reaper(self, interval: float = 5.0):
@@ -151,7 +177,7 @@ class ThreadHost:
         self.reg, self.ops, self.owner, self.cfg, self.logger = registry, ops, owner, cfg, log
         self.session = session_id
         self.state = STARTING
-        self.phase = "starting"          # finer-grained, for logs: first_byte|streaming|settle|watch|...
+        self._sub = "starting"           # sub-phase while RUNNING (first_byte|streaming|settle); host thread only
         self.out: queue.Queue = queue.Queue()
         self._queues = [self.out]        # one queue per turn; readers keep theirs until its END
         self.ready = threading.Event()   # set once the page is open and checked (or that failed)
@@ -161,9 +187,11 @@ class ThreadHost:
         self.cmd: queue.Queue = queue.Queue()
         self.results: queue.Queue = queue.Queue()
         self.closed = threading.Event()
+        self.released = threading.Event()   # set once the registry entry + account are gone
         self.cancel_req = threading.Event()
         self.stop_stream = threading.Event()
-        self.started = time.time()
+        self.started = mono()            # host creation
+        self.turn_started = self.started # reset at every turn: the cap is per turn
         self.page_open = False
         self.tid = None
         self.turn: Turn | None = None
@@ -177,6 +205,7 @@ class ThreadHost:
     # ---- called with reg.lock held: pure in-memory
     def _new_turn_locked(self, tid):
         self._epoch += 1
+        self.turn_started = mono()
         self.tid = tid
         self.turn = Turn(tid, self._epoch)
 
@@ -188,6 +217,12 @@ class ThreadHost:
         del self._queues[:-2]
         self._new_turn_locked(tid)
         self.cmd.put(prompt)
+
+    @property
+    def phase(self):
+        """Derived, never stored: the state, refined by the sub-phase while a turn streams."""
+        st = self.state
+        return self._sub if st == RUNNING else st
 
     @property
     def busy(self):
@@ -233,6 +268,37 @@ class ThreadHost:
         self.results.put(body)
         return True, "ok"
 
+    def _status(self, timeout: float | None = None):
+        """ops.status with its own deadline: a hung sessions.get can never block cap/cancel handling."""
+        timeout = timeout or self.cfg.get("status_timeout", 15)
+        box = {}
+        def call():
+            try:
+                box["v"] = self.ops.status(self, self.session)
+            except BaseException as e:  # noqa: BLE001
+                box["e"] = e
+        t = threading.Thread(target=call, daemon=True, name=f"pi-host-status-{self.tid}")
+        t.start(); t.join(timeout)
+        if t.is_alive():
+            raise TimeoutError(f"sessions.get did not answer within {timeout:.0f}s")
+        if "e" in box:
+            raise box["e"]
+        return box.get("v")
+
+    def retry_after_s(self) -> float:
+        """Rough hint for account_busy: grace remainder, else a poll interval."""
+        if self.state == GRACE:
+            return self.cfg.get("grace", 10)
+        return max(5.0, self.cfg.get("watch", 3) * 2)
+
+    def _cas(self, frm: tuple, to: str) -> bool:
+        """Compare-and-set: change state only from one of `frm` (never overwrites CLOSING/BROKEN/CLOSED)."""
+        with self.reg.lock:
+            if self.state in frm:
+                self.state = to
+                return True
+            return False
+
     def _set_state(self, st):
         with self.reg.lock:
             if self.state not in (CLOSING, CLOSED, BROKEN):
@@ -253,16 +319,14 @@ class ThreadHost:
 
     def _run(self, prompt: str):
         try:
-            acc = self.ops.open(self)                 # page + account (blocking I/O, no lock held)
-            if acc:
-                self.reg.mark_account(self, acc)
+            self.ops.open(self)                       # page (blocking I/O, no lock held); account reserved in reserve()
             self.page_open = True
             self._log("page_open")
             if self.session and self.cfg.get("check_running", True):
                 # existing thread that muse2api did not hold: Muse may still be running it
                 self._set_state(CHECKING)
                 try:
-                    st = self.ops.status(self, self.session)
+                    st = self._status()
                 except Exception as e:  # noqa: BLE001
                     self.open_error = f"state_unknown: sessions.get failed: {e}"
                     self._break(self.open_error)
@@ -272,8 +336,7 @@ class ThreadHost:
                     self.muse_busy = True
                     self._break(f"muse_status {st} at open")
                     return
-            self._set_state(RUNNING)
-            if self.state != RUNNING:                  # broken/closed while opening (e.g. check timed out)
+            if not self._cas((STARTING, CHECKING), RUNNING):   # broken/closed meanwhile (reaper, timeout)
                 return
             self.ready.set()
             pump = threading.Thread(target=self._pump, daemon=True, name=f"pi-host-pump-{self.tid}")
@@ -287,7 +350,6 @@ class ThreadHost:
                     if self.state not in (RUNNING, WATCH):  # closed/broken meanwhile (reaper, shutdown)
                         break
                     self.state = GRACE
-                self.phase = "grace"
                 prompt = self._next_prompt()
         except Exception as e:  # noqa: BLE001
             if not self.ready.is_set():
@@ -321,18 +383,18 @@ class ThreadHost:
             self.closed.wait(self.cfg.get("pump_interval", 0.3))
 
     def _turn(self, prompt: str):
-        t0 = time.time()
+        t0 = time.time(); m0 = mono()
         self.emit({"type": "start", "turn_id": self.tid, "held_page": True})
         try:
-            self.phase = "first_byte"
+            self._sub = "first_byte"
             text = []
             for chunk in self.ops.stream(self, prompt):
-                self.phase = "streaming"
+                self._sub = "streaming"
                 text.append(chunk)
                 self.emit({"type": "text", "delta": chunk})
             if self.cancel_req.is_set():
                 return self._watch()      # performs the cancel and the wait
-            self.phase = "settle"
+            self._sub = "settle"
             self.emit({"type": "text_done", "text": "".join(text)})
             self.ops.settle(self)
             self._finish(status="completed")
@@ -343,13 +405,13 @@ class ThreadHost:
             st = None
             if self.session:
                 try:
-                    st = self.ops.status(self, self.session)
+                    st = self._status()
                 except Exception:  # noqa: BLE001
                     st = None
             held = retryable and st == "running"
             rec = {"type": "error", "message": f"{type(e).__name__}: {e}", "code": code, "retryable": retryable,
                    "phase": getattr(e, "phase", None) or self.phase, "timeout_s": getattr(e, "timeout_s", None),
-                   "waited_s": getattr(e, "waited_s", None), "elapsed_s": round(time.time() - t0, 1),
+                   "waited_s": getattr(e, "waited_s", None), "elapsed_s": round(mono() - m0, 1),
                    "started_at": datetime.fromtimestamp(t0).astimezone().isoformat(timespec="seconds"),
                    "failed_at": datetime.now().astimezone().isoformat(timespec="seconds"),
                    "session_id": self.session, "turn_id": self.tid, "muse_status": st,
@@ -377,12 +439,11 @@ class ThreadHost:
 
     def _watch(self):
         """Detached: keep the page + device alive until the Muse thread leaves `running`."""
-        self.phase = "watch"
         self._set_state(WATCH)
         self._log("watch_start")
         fails = 0
         while not self.closed.is_set():
-            if time.time() > self.started + self.cfg["cap"]:
+            if mono() > self.turn_started + self.cfg["cap"]:
                 st = self._do_cancel()
                 unconfirmed = st not in NOT_RUNNING
                 self._log("cap_cancel", muse_status=st, cancel_unconfirmed=unconfirmed)
@@ -402,7 +463,7 @@ class ThreadHost:
                 self._finish(status=st)
                 return True
             try:
-                st = self.ops.status(self, self.session)
+                st = self._status()
                 fails = 0
             except Exception as e:  # noqa: BLE001
                 fails += 1
@@ -425,11 +486,11 @@ class ThreadHost:
             r = self.ops.cancel(self, self.session) or {}
         except Exception as e:  # noqa: BLE001
             r = {"error": str(e)}
-        end = time.time() + self.cfg.get("cancel_wait", 30)
+        end = mono() + self.cfg.get("cancel_wait", 30)
         st = None
-        while time.time() < end:
+        while mono() < end:
             try:
-                st = self.ops.status(self, self.session)
+                st = self._status()
             except Exception:  # noqa: BLE001
                 st = None
             if st and st != "running":
@@ -443,34 +504,42 @@ class ThreadHost:
         self.cancel_req.set(); self.stop_stream.set()
         if not wait:
             return {"requested": True}
-        end = time.time() + timeout
-        while time.time() < end and self.state in (RUNNING, WATCH, STARTING, CHECKING):
+        end = mono() + timeout
+        while mono() < end and self.state in (RUNNING, WATCH, STARTING, CHECKING):
             time.sleep(0.1)
         return {"cancelled": self.last_status in NOT_RUNNING, "status": self.last_status,
                 "cancel_unconfirmed": self.last_status not in NOT_RUNNING, "closed": self.closed.is_set()}
 
     def force_close(self, reason: str):
         with self._close_lock:
-            if self.closed.is_set():
-                return
+            again = self.closed.is_set()
             self.closed.set()
+        if again:
+            # closed before (e.g. by the reaper while open() was still creating the page): close again,
+            # idempotently, so a page created after the first close cannot leak
+            try:
+                self.ops.close_page(self)
+            except Exception as e:  # noqa: BLE001
+                self._log("close_error", error=str(e))
+            return
         with self.reg.lock:
             if self.state != CLOSED:
                 self.state = CLOSING
         try:
-            self.ops.close_page(self)             # I/O, no lock held
+            self.ops.close_page(self)             # always attempted, idempotent (page may exist without page_open)
         except Exception as e:  # noqa: BLE001
             self._log("close_error", error=str(e))
         self.page_open = False
-        self.reg.release(self)                    # registry entry + account reservation, one lock hold
+        self.reg.release(self)                    # registry entry + account reservation (only if ours), one lock hold
+        self.released.set()
         try:
-            self.ops.release_account(self)        # muse2api's account pool (its own lock, not nested)
+            self.ops.release_account(self)        # muse2api's account pool: ops releases only what IT acquired
         except Exception as e:  # noqa: BLE001
             self._log("release_error", error=str(e))
         self.ready.set()
         for q in list(self._queues):
             q.put(None)
-        self._log("page_closed", reason=reason, age_s=round(time.time() - self.started, 1), broken=self.broken)
+        self._log("page_closed", reason=reason, age_s=round(mono() - self.started, 1), broken=self.broken)
 
     # ---- state for /pi/v1/thread/state
     def info(self, client_id: str | None):
@@ -507,10 +576,18 @@ def sse_from_host(host: ThreadHost, heartbeat: float, first: dict | None = None)
     return gen()
 
 
-def start_or_busy(reg: Registry, session_id, client_id, prompt, tid, make_host, wait_s: float):
-    """Server-side per-thread lock + Muse state check.
-    Returns ("reuse"|"new", host) | ("busy", info) | ("unavailable", info) [fail closed -> 503]."""
-    kind, h = reg.reserve(session_id, client_id, prompt, tid, make_host)
+def start_or_busy(reg: Registry, session_id, client_id, prompt, tid, make_host, wait_s: float, accounts=None,
+                  closing_wait_s: float = 5.0, closing_retries: int = 3):
+    """Server-side per-thread lock + account reservation + Muse state check.
+    Returns ("reuse"|"new", host) | ("busy"|"account_busy"|"unavailable", info)."""
+    for _ in range(closing_retries + 1):
+        kind, h = reg.reserve(session_id, client_id, prompt, tid, make_host, accounts=accounts)
+        if kind != "closing":
+            break
+        h.released.wait(closing_wait_s)   # the previous page of this thread is closing: wait OUTSIDE the lock
+    else:
+        return "busy", {"error": "thread_busy", "session_id": session_id, "phase": "closing", "retry_after": 1,
+                        "held": True, "muse_status": None, "owner_is_you": False}
     if kind != "new":
         return kind, h
     h.start(prompt)

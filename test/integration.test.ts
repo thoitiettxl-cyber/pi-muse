@@ -303,3 +303,41 @@ test("409 closing (previous page still closing) -> short retry, then the turn op
 	assert.equal(mock.st.turns.length, 1);
 	mock.close();
 });
+
+test("strict mode: after a non-allowlisted step -> ask the user (even outside the guard window)", async () => {
+	const { r, mock, delta } = await scenario("strict-stop", { bg: "stopped" }, { PI_MUSE_STRICT: "1", PI_MUSE_NON_IDEMPOTENT_WINDOW: "0" });
+	assert.equal(r.reason, "error");
+	assert.match(r.msg.errorMessage, /Not auto-continuing \(strict mode\): the last step \(bash .*\) is not on the read-only allowlist/);
+	assert.equal(mock.st.turns.length, 1);
+	assert.equal(delta.guarded, 1);
+});
+
+test("strict mode: after an allowlisted read-only step -> auto-continue", async () => {
+	const { r, mock } = await scenario("strict-continue", { bg: "stopped", command: "ls; pwd | wc -l" }, { PI_MUSE_STRICT: "1" });
+	assert.equal(r.msg.content.find((c: any) => c.type === "text").text, "resumed ok");
+	assert.equal(mock.st.turns.length, 2);
+});
+
+test("503 account_busy: bounded wait honours Retry-After, then the turn opens", async () => {
+	const mock = await startMock({ bg: "stopped", turnGate: { kind: "account_busy", times: 1 } });
+	process.env.MUSE2API_URL = mock.url;
+	process.env.PI_MUSE_ACCOUNT_BUSY_WAIT = "5";
+	const t0 = Date.now();
+	const r = await drain(streamLocal(model, { messages: followUp(mock.SID, "hello") } as any));
+	assert.equal(r.reason, "toolUse");
+	assert.ok(Date.now() - t0 >= 1000, "waited Retry-After");
+	assert.equal(mock.st.turns.length, 1);
+	mock.close();
+});
+
+test("503 account_busy beyond the bounded wait -> clear 'NOT sent' message", async () => {
+	const mock = await startMock({ bg: "stopped", turnGate: { kind: "account_busy", times: 99 } });
+	process.env.MUSE2API_URL = mock.url;
+	process.env.PI_MUSE_ACCOUNT_BUSY_WAIT = "0";
+	const r = await drain(streamLocal(model, { messages: followUp(mock.SID, "hello") } as any));
+	assert.equal(r.reason, "error");
+	assert.match(r.msg.errorMessage, /Muse account is busy with another thread \(other-thread, watch\).*NOT sent/);
+	assert.equal(mock.st.turns.length, 0);
+	delete process.env.PI_MUSE_ACCOUNT_BUSY_WAIT;
+	mock.close();
+});

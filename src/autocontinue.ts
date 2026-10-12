@@ -66,6 +66,21 @@ export interface LastStep {
 	finishedAt?: number;
 }
 
+// Strict mode allowlist: the only steps after which auto-continue may send a continuation message.
+const STRICT_TOOLS = new Set(["read", "ls", "grep", "find"]);
+const STRICT_BASH = /^(ls|cat|head|tail|grep|rg|find|pwd|wc|git\s+(status|diff|log))(\s|$)/;
+
+/** Strict mode: true only for allowlisted read-only steps (every segment of a bash pipeline/list must qualify). */
+export function isStrictReadOnly(tool: string, args: any): boolean {
+	const t = tool.toLowerCase();
+	if (STRICT_TOOLS.has(t)) return true;
+	if (t !== "bash") return false;
+	const cmd = String(args?.command ?? "").trim();
+	if (!cmd || /[>`]|\$\(|<\(/.test(cmd)) return false; // redirections / substitutions
+	const parts = cmd.split(/\|\||&&|;|\||\n/).map((p) => p.trim()).filter(Boolean);
+	return parts.every((p) => STRICT_BASH.test(p) && !/\s-(delete|exec|execdir|ok|fprint\w*)\b/.test(p) && !/\s--output\b/.test(p));
+}
+
 const READ_ONLY_TOOLS = new Set(["read", "ls", "grep", "find", "glob", "search", "list", "view"]);
 const MUTATING_BASH: [RegExp, string][] = [
 	[/>>/, "appends to a file (>>)"],

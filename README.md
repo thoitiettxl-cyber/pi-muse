@@ -243,6 +243,12 @@ Every decision is logged as one JSON line in `logFile` (`turn_error` with code, 
 seconds waited, bytes/events received, thread id, last device step; `thread_state`, `thread_cancel`,
 `recovery`, `continue`, `lock_rejected`).
 
+### Strict mode, busy accounts and hold limits (v0.6.0)
+
+- **Strict mode** (`strictAutoContinue` / `PI_MUSE_STRICT=1`): auto-continue only happens when the last step was an allowlisted read-only step: `read`, `ls`, `grep`, `find` tools, or a bash command made only of `ls`, `cat`, `head`, `tail`, `grep`, `rg`, `find`, `pwd`, `wc`, `git status|diff|log`. Redirects, command substitution, `find -delete/-exec` are rejected. Otherwise Pi stops and asks you.
+- **Busy account** (HTTP 503 `account_busy`, `Retry-After`): every Muse account backs at most one open thread page. If all are taken, Pi shows "Muse account busy (held by thread …)" and waits up to `accountBusyWaitSeconds` (`PI_MUSE_ACCOUNT_BUSY_WAIT`, default 60, `0` = no wait), honouring `Retry-After`.
+- **Two Pi windows on one thread**: the second one is refused (409 `thread_busy` or a preflight stop); the message is never sent twice.
+
 ## Pi context forwarding (`local` mode)
 
 Muse sees the same standing context a native Pi model gets:
