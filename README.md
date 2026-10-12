@@ -100,7 +100,7 @@ cp pi-muse/examples/muse.example.json ~/.pi/agent/muse.json && chmod 600 ~/.pi/a
 $EDITOR ~/.pi/agent/muse.json
 
 # 3. Install the extension
-pi install ./pi-muse            # or: pi install git:github.com/<you>/pi-muse
+pi install ./pi-muse            # or: pi install git:github.com/thoitiettxl-cyber/pi-muse
 pi --list-models | grep muse
 
 # 4. Go
