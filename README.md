@@ -187,6 +187,23 @@ Non-interactive: `pi -p --model muse/auto/auto "…" < /dev/null` (or `--mode js
 | `PI_MUSE_CONFIG` | | `~/.pi/agent/muse.json` |
 | `PI_MUSE_OFFLINE=1` | | skip live model discovery at startup |
 | `PI_MUSE_MODELS_TIMEOUT_MS` | | `60000` |
+| `PI_MUSE_DUMP=/path.json` | | debug: write each `local`-mode turn payload sent to muse2api to this file |
+
+## Pi context forwarding (`local` mode)
+
+Muse sees the same standing context a native Pi model gets:
+
+| Item | How it reaches Muse |
+|---|---|
+| Pi system prompt (base prompt, tool guidelines, `SYSTEM.md` / `APPEND_SYSTEM.md`, extension prompt sections) | Replayed from the transcript's system messages (leading prompt + named section patches) and sent inside `<pi_system_prompt>` |
+| `AGENTS.md` / `CLAUDE.md` (global `~/.pi/agent/AGENTS.md` + every ancestor dir of the cwd) | Part of Pi's `project_context` section |
+| Skills (`~/.pi/agent/skills`, `~/.agents/skills`, project `.pi/skills` / `.agents/skills`, packages) | Pi's skills index with absolute `SKILL.md` locations; Muse loads a skill on demand with the device `read` command |
+| Prompt templates / `/skill:` commands | Expanded by Pi into the user message, which is forwarded as is |
+| Extension tools | Registered as Muse device commands (name, description, parameters) |
+| Conversation history | Muse keeps its own thread; when a new Muse thread starts mid-session (e.g. after `/muse-new` or a mode switch) a compact transcript of earlier Pi turns is sent once |
+
+The system prompt is sent on the first turn of a Muse thread and again only when it changes (a hash is stored in
+the assistant message's `responseId` as `muse:<thread>#ctx=<hash>`), so follow-up turns stay small.
 
 ## Limitations
 
@@ -197,7 +214,7 @@ Non-interactive: `pi -p --model muse/auto/auto "…" < /dev/null` (or `--mode js
 - **`xml` mode is slow.** Every tool round-trip is a full Muse turn (~25–30 s), and long tool outputs are pasted into the chat.
 - **`sync` mode copies files.** Files up to 2 MB from `git ls-files`, nothing ignored, no `.git`. Changes made locally after `/muse-push` are reported as conflicts and not auto-applied. Muse sometimes needs its VM tools to be reminded to stay inside `~/workspace/pi-sync/<repo>`.
 - **Mirror mode only sees tool summaries.** The web client never receives raw tool names, arguments or stdout. Tool names are inferred and match OpenClaw's core tools.
-- **Pi's system prompt is not forwarded.** Only the latest user message (plus the bridge preamble) is sent; Muse keeps the thread history.
+- **Context forwarding is `local` mode only.** `xml`, `sync` and `mirror` still send only the latest user message (plus their preamble).
 - **One browser, one turn at a time.** muse2api serializes turns. Expect several seconds of page setup per turn.
 - **Model selection is account-wide on Muse.** pi-muse restores the previous model after each turn.
 - **No image input, no usage/cost numbers.**

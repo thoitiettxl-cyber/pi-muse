@@ -228,7 +228,7 @@ function streamMirror(model: Model<Api>, context: TranscriptContext, options?: S
 				for (let i = msgs.length - 1; i >= 0; i--) {
 					const rid = msgs[i]?.role === "assistant" ? msgs[i].responseId : undefined;
 					if (typeof rid === "string" && rid.startsWith("muse:")) {
-						sessionId = rid.slice(5);
+						sessionId = rid.slice(5).split("#ctx=")[0];
 						break;
 					}
 				}
@@ -434,12 +434,77 @@ function nodeIdentity(cwd: string) {
 	return { node_id: `pi-${host}`.toLowerCase(), display_name: `Pi · ${basename(cwd)} (${host})` };
 }
 
-function lastSessionId(msgs: any[]): string | undefined {
+function lastMuseRef(msgs: any[]): { session?: string; ctx?: string } {
 	for (let i = msgs.length - 1; i >= 0; i--) {
 		const rid = msgs[i]?.role === "assistant" ? msgs[i].responseId : undefined;
-		if (typeof rid === "string" && rid.startsWith("muse:")) return rid.slice(5);
+		if (typeof rid === "string" && rid.startsWith("muse:")) {
+			const [session, ctx] = rid.slice(5).split("#ctx=");
+			return { session: session || undefined, ctx };
+		}
 	}
-	return undefined;
+	return {};
+}
+function lastSessionId(msgs: any[]): string | undefined {
+	return lastMuseRef(msgs).session;
+}
+
+// ---- Pi context forwarding --------------------------------------------------------------------
+/**
+ * Pi's assembled system prompt, replayed from the transcript: the leading system message declares
+ * `content` + named `sections` (preamble, project_context = AGENTS.md/CLAUDE.md files, skills index,
+ * extension snippets, ...); later system messages patch sections by name (null removes one).
+ */
+function assembledSystemPrompt(msgs: any[]): string {
+	let base = "";
+	const sections = new Map<string, string>();
+	let first = true;
+	for (const m of msgs) {
+		if (m?.role !== "system") continue;
+		const text = textOf(m.content);
+		if (first) base = text;
+		else if (text) base += `\n\n${text}`;
+		first = false;
+		for (const [k, v] of Object.entries((m.sections ?? {}) as Record<string, string | null>)) {
+			if (v === null) sections.delete(k);
+			else sections.set(k, v);
+		}
+	}
+	return [base, ...sections.values()].filter((x) => x && x.trim()).join("\n\n").trim();
+}
+
+function ctxHash(text: string): string {
+	return createHash("sha256").update(text).digest("hex").slice(0, 12);
+}
+
+/** Compact transcript of earlier Pi turns, for when a fresh Muse thread starts mid-conversation. */
+function priorHistory(msgs: any[], maxChars = 12000): string {
+	const lastUserIdx = msgs.map((m) => m?.role).lastIndexOf("user");
+	const lines: string[] = [];
+	for (const m of msgs.slice(0, Math.max(0, lastUserIdx))) {
+		if (m?.role === "user") lines.push(`USER: ${textOf(m.content).trim().slice(0, 2000)}`);
+		else if (m?.role === "assistant") {
+			const t = textOf(m.content).trim();
+			const calls = (m.content ?? []).filter((c: any) => c?.type === "toolCall").map((c: any) => c.name);
+			if (t || calls.length) lines.push(`ASSISTANT: ${t.slice(0, 2000)}${calls.length ? ` [tools: ${calls.join(", ")}]` : ""}`);
+		}
+	}
+	let out = lines.join("\n");
+	if (out.length > maxChars) out = `…${out.slice(-maxChars)}`;
+	return out;
+}
+
+function contextBlock(system: string, history: string): string {
+	let s = "";
+	if (system)
+		s +=
+			`[Pi context] Below is the system prompt Pi (the coding agent I am using) built for this project. Treat it as ` +
+			`your standing instructions for this whole conversation, with higher priority than your defaults: it contains ` +
+			`the project instructions (AGENTS.md / CLAUDE.md files, global and per-directory) and the available skills. ` +
+			`Skills: when a task matches a skill's description, first read its SKILL.md (at the absolute <location> given) ` +
+			`with the device's read command, then follow it. Absolute paths are allowed for skill files.\n` +
+			`<pi_system_prompt>\n${system}\n</pi_system_prompt>\n\n`;
+	if (history) s += `[Pi context] Earlier conversation in this Pi session (for continuity):\n<pi_history>\n${history}\n</pi_history>\n\n`;
+	return s;
 }
 
 function newOutput(model: Model<Api>): AssistantMessage {
@@ -539,6 +604,7 @@ interface LiveTurn {
 	pending: Map<string, string>; // Pi toolCallId -> Muse request_id
 	tools: InbandTool[];
 	seenTools: Set<string>;
+	ctx?: string;
 }
 let live: LiveTurn | undefined;
 
@@ -547,7 +613,7 @@ function localPreamble(cwd: string, node: { node_id: string; display_name: strin
 		`[Pi bridge] My local project "${basename(cwd)}" is open in Pi on the paired device "${node.display_name}" ` +
 		`(device_id ${node.node_id}, online now). For this request the project lives ONLY on that device: inspect and ` +
 		`change files exclusively by invoking that device's commands (${tools.map((t) => t.name).join(", ")}) ` +
-		`with paths relative to the project root. Do not use your own VM shell, files or workspace for project work, ` +
+		`with paths relative to the project root (absolute paths only for Pi skill files). Do not use your own VM shell, files or workspace for project work, ` +
 		`and do not ask me to upload anything. Invoke one command at a time and wait for its result. ` +
 		`When finished, reply with a short summary of what you changed.]\n\n`
 	);
@@ -602,10 +668,15 @@ function streamLocal(model: Model<Api>, context: TranscriptContext, options?: Si
 				const tools = collectTools(context);
 				const cwd = process.cwd();
 				const node = nodeIdentity(cwd);
-				const sessionId = forceNewThread ? undefined : lastSessionId(msgs);
+				const ref = forceNewThread ? {} : lastMuseRef(msgs);
+				const sessionId = ref.session;
 				forceNewThread = false;
+				const system = assembledSystemPrompt(msgs);
+				const hash = ctxHash(system);
+				const sendSystem = !sessionId || ref.ctx !== hash;
+				const ctxText = contextBlock(sendSystem ? system : "", sessionId ? "" : priorHistory(msgs));
 				let payload: any = {
-					prompt: localPreamble(cwd, node, tools) + userText,
+					prompt: localPreamble(cwd, node, tools) + ctxText + (ctxText ? "[Pi] Current request:\n" : "") + userText,
 					model: model.id,
 					session_id: sessionId,
 					settle_timeout: Math.min(cfg.settleTimeout, 20),
@@ -613,6 +684,7 @@ function streamLocal(model: Model<Api>, context: TranscriptContext, options?: Si
 				};
 				const replaced = await options?.onPayload?.(payload, model as any);
 				if (replaced !== undefined) payload = replaced;
+				if (process.env.PI_MUSE_DUMP) writeFileSync(process.env.PI_MUSE_DUMP, JSON.stringify({ payload, roles: msgs.map((m) => m.role) }, null, 1));
 				const ctl = new AbortController();
 				const res = await fetch(`${cfg.baseUrl}/pi/v1/turn`, {
 					method: "POST",
@@ -621,7 +693,7 @@ function streamLocal(model: Model<Api>, context: TranscriptContext, options?: Si
 					signal: ctl.signal,
 				});
 				if (!res.ok || !res.body) throw new Error(`muse2api HTTP ${res.status}: ${(await res.text()).slice(0, 300)}`);
-				live = { it: sse(res), ctl, reply: "", session: sessionId, pending: new Map(), tools, seenTools: new Set() };
+				live = { it: sse(res), ctl, reply: "", session: sessionId, pending: new Map(), tools, seenTools: new Set(), ctx: hash };
 				e.start();
 				e.think(`Muse is working on ${basename(cwd)} through the local device bridge…\n`);
 			}
@@ -642,7 +714,7 @@ function streamLocal(model: Model<Api>, context: TranscriptContext, options?: Si
 					}
 					const id = `muse_${String(data.request_id).replace(/[^A-Za-z0-9]/g, "").slice(0, 32)}`;
 					turn.pending.set(id, data.request_id);
-					if (turn.session) output.responseId = `muse:${turn.session}`;
+					if (turn.session) output.responseId = `muse:${turn.session}#ctx=${turn.ctx}`;
 					e.toolCall(id, data.command, decodeArgs(tool, data.params ?? {}));
 					options?.signal?.removeEventListener("abort", onAbort);
 					e.finish("toolUse");
@@ -662,7 +734,7 @@ function streamLocal(model: Model<Api>, context: TranscriptContext, options?: Si
 			}
 			live = undefined;
 			if (options?.signal?.aborted) throw new Error("Request was aborted");
-			if (turn.session) output.responseId = `muse:${turn.session}`;
+			if (turn.session) output.responseId = `muse:${turn.session}#ctx=${turn.ctx}`;
 			e.text(turn.reply.trim() || "(Muse finished this turn.)");
 			e.finish("stop");
 		} catch (error) {
