@@ -283,3 +283,23 @@ test("guard: idempotent step (read-only command) -> auto-continue proceeds", asy
 	assert.equal(r.msg.content.find((c: any) => c.type === "text").text, "resumed ok");
 	assert.equal(mock.st.turns.length, 2);
 });
+
+test("503 state_unknown from muse2api -> clear 'NOT sent' error, no retry", async () => {
+	const mock = await startMock({ bg: "stopped", turnGate: { kind: "503" } });
+	process.env.MUSE2API_URL = mock.url;
+	const r = await drain(streamLocal(model, { messages: followUp(mock.SID, "hello") } as any));
+	assert.equal(r.reason, "error");
+	assert.match(r.msg.errorMessage, /could not confirm the state .* Your message was NOT sent/);
+	assert.equal(mock.st.turns.length, 0);
+	mock.close();
+});
+
+test("409 closing (previous page still closing) -> short retry, then the turn opens", async () => {
+	const mock = await startMock({ bg: "stopped", turnGate: { kind: "closing", times: 2 } });
+	process.env.MUSE2API_URL = mock.url;
+	const r = await drain(streamLocal(model, { messages: followUp(mock.SID, "hello") } as any));
+	assert.equal(r.reason, "toolUse");
+	assert.equal(mock.st.rejected409, 2);
+	assert.equal(mock.st.turns.length, 1);
+	mock.close();
+});

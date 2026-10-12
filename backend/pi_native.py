@@ -33,7 +33,7 @@ def _ts(v) -> float | None:
 from fastapi import Body, Depends, HTTPException
 from fastapi.responses import JSONResponse, StreamingResponse
 
-from pi_host import Registry, ThreadHost, sse_from_host
+from pi_host import Registry, ThreadHost, sse_from_host, start_or_busy
 
 HOSTS_REG: dict = {}
 
@@ -182,10 +182,14 @@ def register(app, g):
     @app.post("/pi/v1/invoke_result")
     def pi_invoke_result(body: dict = Body(...), _=Depends(auth)):
         reg = HOSTS_REG.get("reg")
-        h = reg.by_turn.get(body.get("turn_id") or "") if reg else None
+        h = reg.get_turn(body.get("turn_id")) if reg else None
         if h is None or h.closed.is_set():
             raise HTTPException(404, "unknown or finished turn")
-        h.results.put(body)
+        ok, why = h.accept_result(body)
+        if not ok:
+            log.warning("pi_host %s", json.dumps({"event": "result_rejected", "turn_id": body.get("turn_id"),
+                                                  "request_id": body.get("request_id"), "reason": why}))
+            return JSONResponse(status_code=409, content={"ok": False, "error": why})
         return {"ok": True}
 
 
@@ -411,6 +415,7 @@ def register(app, g):
             acc_id = self.acc["id"]; cookies = self.acc["cookies"]; exp = self.acc.get("cookies_exp")
             POOL.acquire(account_id=acc_id, timeout=self.TO["turn"])
             self.pool_held = True
+            self.acc_id = acc_id
             if not GEN_LOCK.acquire(timeout=self.TO["turn"]):
                 raise TimeoutError("connect_timeout: no free browser slot")
             self.gen_held = True
@@ -437,6 +442,7 @@ def register(app, g):
                     except Exception as e:  # noqa: BLE001
                         err = e; time.sleep(0.5)
                 host.emit({"type": "node", "registered": err is None, "error": str(err) if err else None})
+            return acc_id
 
         def _model(self, host):
             model = self.body.get("model")
@@ -503,6 +509,8 @@ def register(app, g):
                     if isinstance(ev, dict) and ev.get("method") == "node.invoke.request":
                         pr = ev.get("params") or {}
                         if node and pr.get("node_id") == node.get("node_id"):
+                            if not host.note_invoke(pr.get("request_id") or ev.get("id")):
+                                continue      # same call id already forwarded this turn (re-attach / replay)
                             host.emit({"type": "invoke", "turn_id": host.tid, "request_id": pr.get("request_id") or ev.get("id"),
                                        "command": pr.get("command"), "params": pr.get("params") or {}, "timeout_ms": pr.get("timeout_ms")})
                             st["last_ev"] = time.time(); st["events"] += 1
@@ -590,7 +598,7 @@ def register(app, g):
             return {"bytes_received": s["bytes"], "events_received": s["events"],
                     "last_invoke": s["last_invoke"], "last_result": s["last_result"]}
 
-        def close(self, host):
+        def close_page(self, host):
             # may run on the reaper thread: close by handle, not via the engine's thread-local page
             try:
                 if self.page is not None:
@@ -613,6 +621,8 @@ def register(app, g):
                 engine.first_token_timeout = 40.0; engine.idle_timeout = 0; engine.activity_fn = None
             if getattr(self, "gen_held", False):
                 self.gen_held = False; GEN_LOCK.release()
+
+        def release_account(self, host):
             if getattr(self, "pool_held", False):
                 self.pool_held = False; POOL.release(self.acc["id"])
 
@@ -625,24 +635,20 @@ def register(app, g):
         client_id = body.get("client_id")
         TO = timeouts(body, bool(body.get("node")))
         tid = "turn-" + uuid.uuid4().hex[:12]
-        with REG.lock:
-            h = REG.get(session_id)
-            if h is not None:
-                # server-side per-thread lock: one in-flight request per Muse thread, across all clients
-                if h.submit(prompt, tid, client_id):
-                    log.warning("pi_host %s", json.dumps({"event": "page_reused", "session_id": session_id, "turn_id": tid}))
-                    return StreamingResponse(sse_from_host(h, TO["heartbeat"]), media_type="text/event-stream",
-                                             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
-                log.warning("pi_host %s", json.dumps({"event": "busy_rejected", "session_id": session_id, "phase": h.phase}))
-                return JSONResponse(status_code=409, content={"error": "thread_busy", "session_id": session_id,
-                                                              "phase": h.phase, "turn_id": h.tid,
-                                                              "owner_is_you": bool(client_id and client_id == h.owner),
-                                                              "message": "Muse thread already has a turn in flight"})
-            acc = store.pick_account(rotate=True, preferred_id=getattr(engine, "current_acc_id", None))
-            if not acc:
-                raise HTTPException(400, "no Muse account imported in muse2api")
-            h = ThreadHost(REG, RealOps(body, TO, acc), client_id, host_cfg(TO), log, session_id=session_id)
-            h.start(prompt, tid)
+        acc = store.pick_account(rotate=True, preferred_id=getattr(engine, "current_acc_id", None))
+        if not acc:
+            raise HTTPException(400, "no Muse account imported in muse2api")
+        kind, h = start_or_busy(REG, session_id, client_id, prompt, tid,
+                                lambda: ThreadHost(REG, RealOps(body, TO, acc), client_id, host_cfg(TO), log, session_id=session_id),
+                                wait_s=TO["connect"] + 120)
+        if kind == "unavailable":
+            log.warning("pi_host %s", json.dumps({"event": "state_unknown_rejected", **h}))
+            return JSONResponse(status_code=503, content=h)
+        if kind == "busy":
+            log.warning("pi_host %s", json.dumps({"event": "busy_rejected", **h}))
+            return JSONResponse(status_code=409, content={**h, "message": "Muse thread already has a turn in flight"})
+        if kind == "reuse":
+            log.warning("pi_host %s", json.dumps({"event": "page_reused", "session_id": session_id, "turn_id": tid}))
         return StreamingResponse(sse_from_host(h, TO["heartbeat"]), media_type="text/event-stream",
                                  headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 

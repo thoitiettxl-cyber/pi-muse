@@ -75,6 +75,22 @@ Each `/pi/v1/turn` runs in a **ThreadHost** that owns one muse.ai page (and the 
 - **Leak protection:** the watcher enforces the turn cap (`PI_NATIVE_TURN_TIMEOUT`, 3600 s) with a cancel. A
   reaper force-closes any host older than cap + `PI_NATIVE_REAPER_SLACK` (60 s), even if its threads hang. All
   hosts are closed on muse2api shutdown.
+- **Unheld existing threads are checked first:** a `/pi/v1/turn` with a `session_id` that muse2api does not
+  hold opens the page, calls `sessions.get` and sends nothing unless the thread is idle. `running` gives
+  409 `{"error":"thread_busy","held":false,"muse_status":"running"}`. If the state can't be read, the request
+  fails closed with 503 `{"error":"state_unknown"}`, and the page and the account are released.
+- **Host states:** `starting → checking → running ⇄ watch → grace → running (reuse) | closing → closed`,
+  plus `broken` from any state. A host is BROKEN when it cannot prove the thread is idle: state unknown,
+  a cap without confirmed cancel, a host error, or `running` at open. It never enters `grace`, is closed, and
+  is removed from the registry, so the next request goes through the `sessions.get` check again. A 409 while
+  a page is still closing carries `retry_after`, and pi-muse retries shortly.
+- **One lock:** a single non-reentrant `Registry.lock` guards the thread/turn maps, host states and account
+  reservations. The registry entry and the account reservation are removed in the same lock hold. No I/O,
+  logging or queue emits happen under it; muse2api's account pool is released right after, outside it.
+- **Tool results per turn:** each turn has an epoch. `/pi/v1/invoke_result` for another turn (stale) or for a
+  call id already answered (duplicate) gets 409. Device calls are forwarded once per call id. Both sets live
+  on the turn, so they survive re-attaching.
+- A cap or cancel that Muse never confirms is reported as `cancel_unconfirmed: true` together with `muse_status`.
 - `GET /pi/v1/hosts` lists the open hosts (debugging).
 
 Tests: `python -m unittest tests.test_pi_host` (fake Muse: device online flag, watcher, reaper, cancel, reuse).

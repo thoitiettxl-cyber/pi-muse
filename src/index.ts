@@ -695,7 +695,7 @@ function turnBody(base: any, cfg: MuseConfig) {
 	return b;
 }
 
-async function openTurn(cfg: MuseConfig, apiKey: string, body: any, ctl: AbortController) {
+async function openTurn(cfg: MuseConfig, apiKey: string, body: any, ctl: AbortController, attempt = 0): Promise<AsyncGenerator<{ event: string; data: any }>> {
 	let res: Response;
 	try {
 		res = await fetch(`${cfg.baseUrl}/pi/v1/turn`, {
@@ -709,10 +709,19 @@ async function openTurn(cfg: MuseConfig, apiKey: string, body: any, ctl: AbortCo
 	}
 	if (res.status === 409) {
 		const j: any = await res.json().catch(() => ({}));
+		if (j.retry_after && attempt < 10) {
+			// the thread's previous page is closing (grace expired / broken): retry shortly, nothing was sent
+			await sleep(j.retry_after * 1000, ctl.signal);
+			return openTurn(cfg, apiKey, body, ctl, attempt + 1);
+		}
 		throw Object.assign(
 			new Error(`Muse thread ${body.session_id ?? ""} is busy: another request (${j.phase ?? "running"}${j.owner_is_you ? "" : ", started from another Pi window"}) is still in flight. Your message was NOT sent; wait for it to finish and send again.`),
 			{ httpStatus: 409, busy: true },
 		);
+	}
+	if (res.status === 503) {
+		const j: any = await res.json().catch(() => ({}));
+		throw Object.assign(new Error(`muse2api could not confirm the state of Muse thread ${body.session_id ?? ""} (${j.message ?? j.error ?? "state unknown"}). Your message was NOT sent.`), { httpStatus: 503 });
 	}
 	if (!res.ok || !res.body) throw Object.assign(new Error(`muse2api HTTP ${res.status}: ${(await res.text()).slice(0, 300)}`), { httpStatus: res.status });
 	return sse(res);

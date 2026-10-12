@@ -17,6 +17,8 @@ export interface MockOpts {
 	errorKind?: "timeout" | "auth" | "disconnect" | "http504";
 	failContinuations?: number; // continuation turns that fail again with a timeout
 	slowContinuationMs?: number;
+	/** /pi/v1/turn answers for existing threads: "503" (state unknown) or N x 409 closing then OK */
+	turnGate?: { kind: "503" } | { kind: "closing"; times: number };
 }
 
 export function startMock(opts: MockOpts) {
@@ -84,6 +86,9 @@ export function startMock(opts: MockOpts) {
 		if (req.url !== "/pi/v1/turn") return json(res, 404, {});
 		// ---- /pi/v1/turn
 		const sess = b.session_id ?? SID;
+		const gate = opts.turnGate;
+		if (b.session_id && gate?.kind === "503") return json(res, 503, { error: "state_unknown", message: "state_unknown: sessions.get failed: timeout" });
+		if (b.session_id && gate?.kind === "closing" && gate.times > 0) { gate.times--; st.rejected409++; return json(res, 409, { error: "thread_busy", phase: "closing", retry_after: 0.05 }); }
 		if (b.session_id && (st.host?.running || (st.inflightBySession.get(sess) ?? 0) > 0)) {
 			// server-side per-thread lock
 			st.rejected409++;
@@ -129,6 +134,6 @@ export function startMock(opts: MockOpts) {
 		res.end();
 	});
 	return new Promise<{ url: string; st: typeof st; SID: string; close: () => void }>((r) =>
-		server.listen(0, "127.0.0.1", () => r({ url: `http://127.0.0.1:${(server.address() as any).port}`, st, SID, close: () => server.close() })),
+		server.listen(0, "127.0.0.1", () => r({ url: `http://127.0.0.1:${(server.address() as any).port}`, st, SID, close: () => { server.closeAllConnections(); server.close(); } })),
 	);
 }
