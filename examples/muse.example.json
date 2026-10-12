@@ -1,0 +1,5 @@
+{
+  "baseUrl": "http://127.0.0.1:18610",
+  "apiKey": "m2a_your_muse2api_key_here",
+  "settleTimeout": 45
+}

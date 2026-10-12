@@ -1,0 +1,16 @@
+diff --git a/app.py b/app.py
+index a1da7f6..b52db4a 100644
+--- a/app.py
++++ b/app.py
+@@ -2438,3 +2438,11 @@ async def _startup():
+ @app.on_event("shutdown")
+ def _shutdown():
+     engine.stop()
++
++
++# --- pi-native endpoints (branch pi-native): see pi_native.py ---
++try:
++    import pi_native as _pi_native
++    _pi_native.register(app, globals())
++except Exception as _exc:  # noqa: BLE001
++    log.warning("pi_native endpoints not loaded: %s", _exc)

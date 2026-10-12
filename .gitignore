@@ -1,0 +1,14 @@
+node_modules/
+dist/
+*.log
+.env
+.env.*
+!.env.example
+muse.json
+muse-workspace/
+*.sse
+*.jsonl
+cookies*.json
+accounts*.json
+data/
+.DS_Store
