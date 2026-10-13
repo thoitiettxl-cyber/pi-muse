@@ -1,6 +1,6 @@
 {
   "name": "pi-muse",
-  "version": "0.6.0",
+  "version": "0.6.1",
   "description": "Pi coding agent provider for the Muse agent (muse.ai): Muse works on the repo open in Pi through Pi's own tools (device-node bridge), with XML-tool, snapshot-sync and VM-mirror modes.",
   "type": "module",
   "license": "MIT",

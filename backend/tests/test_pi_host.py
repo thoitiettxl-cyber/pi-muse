@@ -385,5 +385,40 @@ class ReviewTests(unittest.TestCase):
         self.assertLessEqual(FakeMuse.open_pages, before)
 
 
+
+class GraceRetryAfterTests(unittest.TestCase):
+    def test_retry_after_reflects_remaining_grace(self):
+        import pi_host as P
+        clock = [1000.0]
+        orig = P.mono
+        P.mono = lambda: clock[0]
+        try:
+            reg = Registry()
+            h = ThreadHost(reg, FakeMuse(timeout=False), "c1", dict(CFG, grace=10), None, session_id="G1")
+            with reg.lock:
+                h.state = P.GRACE
+                h.grace_until = P.mono() + h.cfg["grace"]
+            self.assertEqual(h.retry_after_s(), 10.0)
+            clock[0] += 3.5
+            self.assertEqual(h.retry_after_s(), 6.5)
+            clock[0] += 9
+            self.assertEqual(h.retry_after_s(), 0.5)   # floor once grace has run out
+            with reg.lock:
+                h.state = P.RUNNING
+            self.assertEqual(h.retry_after_s(), max(5.0, CFG.get("watch", 3) * 2))
+        finally:
+            P.mono = orig
+
+    def test_grace_until_set_on_real_grace_transition(self):
+        reg = Registry(); m = FakeMuse(timeout=False, open_status="completed")
+        h = mk(reg, m, dict(CFG, grace=5), session="G2")
+        read_until(h, lambda r: r["type"] == "done")
+        for _ in range(200):
+            if h.state == "grace": break
+            time.sleep(0.01)
+        self.assertEqual(h.state, "grace")
+        self.assertTrue(0.5 <= h.retry_after_s() <= 5.0)
+        h.force_close("test")
+
 if __name__ == "__main__":
     unittest.main()

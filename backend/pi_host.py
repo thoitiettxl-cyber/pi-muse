@@ -198,6 +198,7 @@ class ThreadHost:
         self._epoch = 0
         self.account_id = None
         self.last_status = None
+        self.grace_until = None          # mono() deadline of the current GRACE window (set under reg.lock)
         self.attached = 0
         self._close_lock = threading.Lock()   # only serializes force_close; never taken with reg.lock
         self.thread = None
@@ -288,6 +289,8 @@ class ThreadHost:
     def retry_after_s(self) -> float:
         """Rough hint for account_busy: grace remainder, else a poll interval."""
         if self.state == GRACE:
+            if self.grace_until is not None:
+                return max(0.5, self.grace_until - mono())
             return self.cfg.get("grace", 10)
         return max(5.0, self.cfg.get("watch", 3) * 2)
 
@@ -350,6 +353,7 @@ class ThreadHost:
                     if self.state not in (RUNNING, WATCH):  # closed/broken meanwhile (reaper, shutdown)
                         break
                     self.state = GRACE
+                    self.grace_until = mono() + self.cfg["grace"]   # same hold as the GRACE transition
                 prompt = self._next_prompt()
         except Exception as e:  # noqa: BLE001
             if not self.ready.is_set():
@@ -531,6 +535,9 @@ class ThreadHost:
             self._log("close_error", error=str(e))
         self.page_open = False
         self.reg.release(self)                    # registry entry + account reservation (only if ours), one lock hold
+        # released is set AFTER close_page + reg.release and BEFORE ops.release_account (POOL). That is safe:
+        # a waiter in start_or_busy then reserves a new host whose RealOps.open blocks in POOL.acquire until
+        # release_account below frees the pool slot; if that ever stalls, start_deadline reaps the new host.
         self.released.set()
         try:
             self.ops.release_account(self)        # muse2api's account pool: ops releases only what IT acquired

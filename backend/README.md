@@ -115,3 +115,7 @@ All timing uses `time.monotonic()`; the hold cap restarts at every turn.
 - `phase` is derived from `state`; RUNNING is entered only by compare-and-set from CHECKING/STARTING, so CLOSING is never overwritten.
 - `force_close()` always tries an idempotent page close, even if called twice, so a page created late can't leak.
 - Measured real turns (Oct 13 2026): 18–56s normally, one 226s tool-heavy turn; recommendation: keep the 600s default, lower it only for interactive use.
+
+### Future: `PI_MUSE_EVICT_GRACE` (design note, not implemented)
+
+Today a new thread that finds every account held gets 503 `account_busy`. While the holder is in GRACE, `retry_after_s` is the remaining grace time (minimum 0.5s), measured from `grace_until`, which is set under `Registry.lock` in the same hold as the GRACE transition. Possible opt-in: inside `reserve()`, pick a GRACE victim on a candidate account that has been idle for at least 2s. Compare-and-set it GRACE → CLOSING and `cmd.put(None)` to wake its host thread, then return `("closing", victim)`, so the caller waits outside the lock (on `released`) and retries. Never evict RUNNING/WATCH/CHECKING hosts.
