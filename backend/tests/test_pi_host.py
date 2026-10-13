@@ -401,6 +401,18 @@ class GraceRetryAfterTests(unittest.TestCase):
             self.assertEqual(h.retry_after_s(), 10.0)
             clock[0] += 3.5
             self.assertEqual(h.retry_after_s(), 6.5)
+            # another thread on the same (only) account: busy result rounds the remainder UP
+            with reg.lock:
+                reg.accounts["A1"] = h
+                h.account_id = "A1"
+            made = []
+            kind, info = reg.reserve("OTHER", "c2", "p", "t-other",
+                                     lambda acc: made.append(acc) or ThreadHost(reg, FakeMuse(timeout=False), "c2", dict(CFG), None),
+                                     accounts=[{"id": "A1"}])
+            self.assertEqual(kind, "account_busy")
+            self.assertEqual(info["retry_after_s"], 7)
+            self.assertEqual(info["held_by_thread"], "G1")
+            self.assertEqual(made, [])                 # no host built for the refused thread
             clock[0] += 9
             self.assertEqual(h.retry_after_s(), 0.5)   # floor once grace has run out
             with reg.lock:

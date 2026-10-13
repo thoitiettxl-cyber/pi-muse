@@ -25,6 +25,7 @@ Host states:  STARTING -> CHECKING (existing thread: sessions.get) -> RUNNING <-
 from __future__ import annotations
 
 import json
+import math
 import queue
 import threading
 import time
@@ -105,7 +106,7 @@ class Registry:
                                             "account_id": accounts[0]["id"] if accounts else None,
                                             "held_by_thread": other.session if other else None,
                                             "held_state": other.state if other else None,
-                                            "retry_after_s": max(1, int(other.retry_after_s())) if other else 5}
+                                            "retry_after_s": max(1, math.ceil(other.retry_after_s())) if other else 5}
             h = make_host(acc)                  # constructor touches no registry state, no I/O
             h._new_turn_locked(tid)
             if acc is not None:
